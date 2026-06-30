@@ -21,8 +21,6 @@ A self-contained local dashboard for checking Codex reset credits, current usage
 - `Start-CodexResetsServer.ps1`: Starts the local browser/proxy server used for live refreshes.
 - `index.html`: The generated self-contained dashboard.
 - `.codex-cache/`: Local cached account snapshots from successful live polls. This directory is ignored by git.
-- `dashboard-screenshot.png`: Redacted screenshot for documentation.
-- `.gitignore`: Prevents saved auth bundles from being committed.
 
 ## How It Works
 
