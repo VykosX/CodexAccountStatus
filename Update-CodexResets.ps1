@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
   [string]$AuthPath = (Join-Path $HOME ".codex\auth.json"),
-  [string]$AccountsDir = (Join-Path $PSScriptRoot ".codex-accounts"),
+  [string]$CacheDir = (Join-Path $PSScriptRoot ".codex-cache"),
   [string]$OutputPath = (Join-Path $PSScriptRoot "index.html"),
+  [string]$LiveApiBase = "http://127.0.0.1:8787",
   [switch]$SkipSaveCurrent,
   [switch]$SkipFetch
 )
@@ -25,6 +26,23 @@ function Read-JsonFile {
   param([Parameter(Mandatory = $true)][string]$Path)
 
   return ConvertFrom-JsonWithStringDates (Get-Content -LiteralPath $Path -Raw)
+}
+
+function Write-JsonFile {
+  param(
+    [Parameter(Mandatory = $true)]$Value,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  $jsonArgs = @{
+    Depth = 100
+  }
+  if ((Get-Command ConvertTo-Json).Parameters.ContainsKey("EscapeHandling")) {
+    $jsonArgs.EscapeHandling = "EscapeNonAscii"
+  }
+
+  $json = $Value | ConvertTo-Json @jsonArgs
+  Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
 }
 
 function Get-PropertyValue {
@@ -96,7 +114,7 @@ function Convert-ToLocalStamp {
     )
   }
 
-  return $date.LocalDateTime.ToString("yyyy-MM-dd_HH:mm:ss")
+  return $date.LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
 }
 
 function Convert-UnixSecondsToLocalStamp {
@@ -106,7 +124,7 @@ function Convert-UnixSecondsToLocalStamp {
     return $null
   }
 
-  return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime.ToString("yyyy-MM-dd_HH:mm:ss")
+  return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
 }
 
 function New-SafeFileStem {
@@ -158,38 +176,17 @@ function Get-AuthAccountInfo {
     name = Get-PropertyValue $idPayload "name"
     plan = First-NonEmpty (Get-PropertyValue $accessAuth "chatgpt_plan_type") (Get-PropertyValue $idAuth "chatgpt_plan_type")
     accessToken = $accessToken
+    refreshToken = Get-PropertyValue $tokens "refresh_token"
     accessTokenExpiresAt = Convert-UnixSecondsToLocalStamp (Get-PropertyValue $accessPayload "exp")
     sourcePath = $SourcePath
   }
 }
 
-function Save-CurrentAccountAuth {
-  param(
-    [Parameter(Mandatory = $true)][string]$AuthPath,
-    [Parameter(Mandatory = $true)][string]$AccountsDir
-  )
-
-  if (-not (Test-Path -LiteralPath $AuthPath)) {
-    throw "Auth file not found: $AuthPath"
-  }
-
-  New-Item -ItemType Directory -Force -Path $AccountsDir | Out-Null
-
-  $auth = Read-JsonFile $AuthPath
-  $info = Get-AuthAccountInfo $auth $AuthPath
-  $identity = First-NonEmpty $info.email $info.name $info.accountId
-  $shortId = $info.accountId.Substring(0, [Math]::Min(8, $info.accountId.Length))
-  $fileName = "$(New-SafeFileStem "$identity-$shortId").auth.json"
-  $destination = Join-Path $AccountsDir $fileName
-
-  Copy-Item -LiteralPath $AuthPath -Destination $destination -Force
-  Write-Host "Saved active account token bundle for $identity to $destination"
-}
-
 function Invoke-CodexApi {
   param(
     [Parameter(Mandatory = $true)]$Account,
-    [Parameter(Mandatory = $true)][string]$Path
+    [Parameter(Mandatory = $true)][string]$Path,
+    [switch]$RetriedAfterRefresh
   )
 
   $headers = @{
@@ -201,13 +198,107 @@ function Invoke-CodexApi {
     "User-Agent" = "codex-resets-page/1.0"
   }
 
-  $response = Invoke-WebRequest `
-    -Uri "https://chatgpt.com/backend-api$Path" `
-    -Headers $headers `
-    -Method Get `
-    -TimeoutSec 30
+  try {
+    $response = Invoke-WebRequest `
+      -Uri "https://chatgpt.com/backend-api$Path" `
+      -Headers $headers `
+      -Method Get `
+      -TimeoutSec 30
+  } catch {
+    $statusCode = $null
+    if ($_.Exception.Response) {
+      $statusCode = [int]$_.Exception.Response.StatusCode
+    }
+
+    if ($statusCode -eq 401 -and -not $RetriedAfterRefresh -and -not (Get-PropertyValue $Account "tokenRefreshAttempted")) {
+      $Account | Add-Member -MemberType NoteProperty -Name "tokenRefreshAttempted" -Value $true -Force
+      Refresh-SavedAccountToken $Account
+      return Invoke-CodexApi $Account $Path -RetriedAfterRefresh
+    }
+
+    if ($statusCode -eq 401) {
+      throw "Saved credentials for $(First-NonEmpty $Account.email $Account.accountId) were rejected by Codex after a refresh attempt. Switch Codex to this account and rerun .\Update-CodexResets.ps1 so the project can re-capture the current auth bundle."
+    }
+
+    throw
+  }
 
   return ConvertFrom-JsonWithStringDates $response.Content
+}
+
+function Refresh-SavedAccountToken {
+  param([Parameter(Mandatory = $true)]$Account)
+
+  if ([string]::IsNullOrWhiteSpace([string]$Account.refreshToken)) {
+    throw "Saved token for $(First-NonEmpty $Account.email $Account.accountId) was rejected and no refresh_token is available."
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$Account.sourcePath)) {
+    throw "Saved token for $(First-NonEmpty $Account.email $Account.accountId) was rejected and has no source file to update."
+  }
+
+  Write-Host "Refreshing saved token for $(First-NonEmpty $Account.email $Account.accountId)..."
+
+  $body = @{
+    client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+    grant_type = "refresh_token"
+    refresh_token = $Account.refreshToken
+    scope = "openid profile email offline_access"
+  }
+
+  $response = Invoke-WebRequest `
+    -Uri "https://auth.openai.com/oauth/token" `
+    -Method Post `
+    -Body $body `
+    -ContentType "application/x-www-form-urlencoded" `
+    -Headers @{ Accept = "application/json" } `
+    -TimeoutSec 30
+
+  $tokens = ConvertFrom-JsonWithStringDates $response.Content
+  $accessToken = Get-PropertyValue $tokens "access_token"
+  if ([string]::IsNullOrWhiteSpace([string]$accessToken)) {
+    throw "Token refresh did not return an access_token."
+  }
+
+  $newRefreshToken = First-NonEmpty (Get-PropertyValue $tokens "refresh_token") $Account.refreshToken
+  $auth = Read-JsonFile $Account.sourcePath
+  if ($null -eq (Get-PropertyValue $auth "tokens")) {
+    $auth | Add-Member -MemberType NoteProperty -Name "tokens" -Value ([pscustomobject]@{}) -Force
+  }
+
+  $auth.tokens | Add-Member -MemberType NoteProperty -Name "access_token" -Value $accessToken -Force
+  $auth.tokens | Add-Member -MemberType NoteProperty -Name "refresh_token" -Value $newRefreshToken -Force
+  $idToken = Get-PropertyValue $tokens "id_token"
+  if (-not [string]::IsNullOrWhiteSpace([string]$idToken)) {
+    $auth.tokens | Add-Member -MemberType NoteProperty -Name "id_token" -Value $idToken -Force
+  }
+  if (-not [string]::IsNullOrWhiteSpace([string]$Account.accountId)) {
+    $auth.tokens | Add-Member -MemberType NoteProperty -Name "account_id" -Value $Account.accountId -Force
+  }
+  $auth | Add-Member -MemberType NoteProperty -Name "last_refresh" -Value ([DateTimeOffset]::UtcNow.ToString("o")) -Force
+
+  Write-JsonFile $auth $Account.sourcePath
+
+  $updated = Get-AuthAccountInfo $auth $Account.sourcePath
+  if ($updated.accountId -ne $Account.accountId) {
+    throw "Refreshed token account id changed from $($Account.accountId) to $($updated.accountId); refusing to retry with mismatched credentials."
+  }
+
+  $Account.accessToken = $updated.accessToken
+  $Account.refreshToken = $updated.refreshToken
+  $Account.accessTokenExpiresAt = $updated.accessTokenExpiresAt
+}
+
+function Get-FriendlyAccountError {
+  param(
+    [Parameter(Mandatory = $true)]$Account,
+    [Parameter(Mandatory = $true)][string]$Message
+  )
+
+  if ($Message -match "401|Unauthorized") {
+    return "Saved credentials for $(First-NonEmpty $Account.email $Account.accountId) were rejected by Codex. Switch Codex to this account and rerun .\Update-CodexResets.ps1 so the project can re-capture the current auth bundle."
+  }
+
+  return $Message
 }
 
 function Convert-WindowLabel {
@@ -355,7 +446,18 @@ function Get-ResetCredits {
 function ConvertTo-HtmlJson {
   param([Parameter(Mandatory = $true)]$Value)
 
-  return $Value | ConvertTo-Json -Depth 20 -Compress -EscapeHandling EscapeHtml
+  $convertToJsonCommand = Get-Command ConvertTo-Json
+  if ($convertToJsonCommand.Parameters.ContainsKey("EscapeHandling")) {
+    return $Value | ConvertTo-Json -Depth 20 -Compress -EscapeHandling EscapeHtml
+  }
+
+  $json = $Value | ConvertTo-Json -Depth 20 -Compress
+  return $json.
+    Replace("&", "\u0026").
+    Replace("<", "\u003c").
+    Replace(">", "\u003e").
+    Replace([char]0x2028, "\u2028").
+    Replace([char]0x2029, "\u2029")
 }
 
 function Write-ResetHtml {
@@ -673,6 +775,7 @@ function Write-ResetHtml {
     const resetData = JSON.parse(document.getElementById("reset-data").textContent);
     const total = Number(resetData.totalAvailable || 0);
     const accounts = Array.isArray(resetData.accounts) ? resetData.accounts : [];
+    const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || resetData.timeZone || "local";
 
     document.getElementById("total").textContent = String(total);
     document.getElementById("summary").textContent =
@@ -680,7 +783,7 @@ function Write-ResetHtml {
     document.getElementById("source").innerHTML =
       `Generated at <code>${escapeHtml(resetData.generatedAt || "")}</code>. ` +
       `Source: saved auth bundles in <code>${escapeHtml(resetData.accountsDir || "")}</code> plus the reset-credit API. ` +
-      `Times are local and formatted as <code>YYYY-MM-DD_HH:MM:SS</code>.`;
+      `Local timezone: <code>${escapeHtml(localTimeZone)}</code>.`;
 
     const accountsRoot = document.getElementById("accounts");
 
@@ -755,6 +858,7 @@ function Write-ResetHtml {
 function Write-CodexDashboardHtml {
   param(
     [Parameter(Mandatory = $true)]$Snapshot,
+    [Parameter(Mandatory = $true)]$LiveAuth,
     [Parameter(Mandatory = $true)][string]$OutputPath
   )
 
@@ -1139,6 +1243,12 @@ function Write-CodexDashboardHtml {
       white-space: nowrap;
     }
 
+    .live-note {
+      color: var(--dim);
+      font-size: 12px;
+      margin-top: 10px;
+    }
+
     .note,
     .error-note {
       color: var(--muted);
@@ -1271,23 +1381,174 @@ function Write-CodexDashboardHtml {
   </main>
 
   <script id="reset-data" type="application/json">__RESET_DATA_JSON__</script>
+  <script id="live-auth" type="application/json">__LIVE_AUTH_JSON__</script>
   <script>
     const resetData = JSON.parse(document.getElementById("reset-data").textContent);
+    const liveAuth = JSON.parse(document.getElementById("live-auth").textContent);
     const accounts = Array.isArray(resetData.accounts) ? resetData.accounts : [];
-    const total = Number(resetData.totalAvailable || 0);
+    const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || resetData.timeZone || "local";
     let activeIndex = 0;
 
-    document.getElementById("total").textContent = String(total);
-    document.getElementById("summary").textContent =
-      `${accounts.length} saved account${accounts.length === 1 ? "" : "s"} - ${total} reset ${total === 1 ? "credit" : "credits"} available.`;
+    updateChromeText();
     document.getElementById("source").innerHTML =
       `Generated at <code>${escapeHtml(resetData.generatedAt || "")}</code>. ` +
-      `Sources: <code>~/.codex/auth.json</code>, saved bundles in <code>${escapeHtml(resetData.accountsDir || "")}</code>, ` +
+      `Live refresh uses <code>${escapeHtml(liveAuth.apiBase || "")}</code>; other tabs use <code>${escapeHtml(resetData.accountsDir || "")}</code>. ` +
       `<code>/backend-api/wham/usage</code>, <code>/backend-api/wham/profiles/me</code>, and <code>/backend-api/wham/rate-limit-reset-credits</code>. ` +
-      `Times are local and formatted as <code>YYYY-MM-DD_HH:MM:SS</code>.`;
+      `Local timezone: <code>${escapeHtml(localTimeZone)}</code>.`;
 
     renderTabs();
     renderAccount();
+    refreshLiveAccount();
+    setInterval(refreshLiveAccount, 30000);
+
+    function updateChromeText() {
+      const total = accounts.reduce((sum, account) => sum + Number(account.availableCount || 0), 0);
+      document.getElementById("total").textContent = String(total);
+      document.getElementById("summary").textContent =
+        `${accounts.length} account snapshot${accounts.length === 1 ? "" : "s"} - ${total} reset ${total === 1 ? "credit" : "credits"} available.`;
+    }
+
+    async function refreshLiveAccount() {
+      if (!liveAuth || !liveAuth.apiBase || !liveAuth.accountId) return;
+      const index = accounts.findIndex((account) => account.accountId === liveAuth.accountId);
+      if (index < 0) return;
+
+      const account = accounts[index];
+      account.liveRefreshState = "refreshing";
+      if (index === activeIndex) renderAccount();
+
+      try {
+        const [credits, usage, profile] = await Promise.all([
+          fetchCodexJson("/backend-api/wham/rate-limit-reset-credits"),
+          fetchCodexJson("/backend-api/wham/usage"),
+          fetchCodexJson("/backend-api/wham/profiles/me")
+        ]);
+
+        applyLiveCredits(account, credits);
+        account.usageStatus = normalizeUsageStatus(usage);
+        account.profileStats = normalizeProfileStats(profile);
+        account.resetCreditsError = null;
+        account.usageError = null;
+        account.profileError = null;
+        account.error = null;
+        account.isLive = true;
+        account.dataSource = "live browser refresh";
+        account.lastPolledAt = localStamp(new Date());
+        account.liveRefreshState = "ok";
+        account.liveRefreshError = null;
+      } catch (error) {
+        account.liveRefreshState = "failed";
+        account.liveRefreshError = `Live browser refresh failed; showing cached data. ${error.message || error}`;
+      }
+
+      updateChromeText();
+      renderTabs();
+      if (index === activeIndex) renderAccount();
+    }
+
+    async function fetchCodexJson(path) {
+      const response = await fetch(`${liveAuth.apiBase}${path}`, {
+        method: "GET",
+        headers: {
+          Accept: "application/json"
+        },
+        cache: "no-store"
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`.trim());
+      return response.json();
+    }
+
+    function applyLiveCredits(account, payload) {
+      const rawCredits = Array.isArray(payload) ? payload : (Array.isArray(payload?.credits) ? payload.credits : []);
+      const credits = rawCredits.map((credit) => ({
+        id: credit.id || credit.credit_id || "",
+        resetType: credit.reset_type || credit.resetType || "",
+        status: credit.status || "",
+        grantedAt: localStamp(credit.granted_at || credit.grantedAt || credit.created_at || credit.createdAt),
+        expiresAt: localStamp(credit.expires_at || credit.expiresAt || credit.expiration_time || credit.expirationTime),
+        title: credit.title || credit.name || "Codex reset",
+        description: credit.description || ""
+      })).filter((credit) => (credit.status || "").toLowerCase() !== "used");
+
+      account.credits = credits;
+      account.availableCount = credits.filter((credit) => (credit.status || "").toLowerCase() === "available").length;
+    }
+
+    function normalizeUsageStatus(payload) {
+      const usage = payload || {};
+      const rateLimit = usage.rate_limit || usage.rateLimit || usage;
+      const windows = Array.isArray(usage.windows)
+        ? usage.windows
+        : [
+            rateLimit.primary_window ? { kind: "primary", ...rateLimit.primary_window } : null,
+            rateLimit.secondary_window ? { kind: "secondary", ...rateLimit.secondary_window } : null,
+            usage.primary ? { kind: "primary", ...usage.primary } : null,
+            usage.secondary ? { kind: "secondary", ...usage.secondary } : null
+          ].filter(Boolean);
+      return {
+        allowed: rateLimit.allowed,
+        limitReached: rateLimit.limit_reached ?? rateLimit.limitReached,
+        rateLimitReachedType: usage.rate_limit_reached_type ?? usage.rateLimitReachedType,
+        windows: windows.map((window) => normalizeUsageWindow(window)),
+        credits: usage.credits || usage.credit_grants || {},
+        spendControl: usage.spend_control || usage.spendControl || {},
+        rateLimitResetCredits: usage.rate_limit_reset_credits || usage.rateLimitResetCredits || {}
+      };
+    }
+
+    function normalizeUsageWindow(window) {
+      const limitWindowSeconds = Number(window.limit_window_seconds ?? window.limitWindowSeconds ?? window.window_seconds ?? 0);
+      const usedPercentRaw = Number(window.used_percent ?? window.usedPercent ?? window.percent_used ?? 0);
+      const remainingRaw = window.remaining_percent ?? window.remainingPercent;
+      const remainingPercent = remainingRaw == null ? 100 - usedPercentRaw : Number(remainingRaw);
+      const resetAfterSeconds = window.reset_after_seconds ?? window.resetAfterSeconds;
+      const resetAtRaw = window.reset_at || window.resetAt || window.resets_at || window.resetsAt;
+      const resetAt = resetAtRaw
+        ? localStamp(typeof resetAtRaw === "number" ? new Date(resetAtRaw * 1000) : resetAtRaw)
+        : (resetAfterSeconds == null ? "" : localStamp(new Date(Date.now() + Number(resetAfterSeconds) * 1000)));
+      return {
+        kind: window.kind || "",
+        label: window.label || labelForWindow(limitWindowSeconds),
+        usedPercent: Math.round(clampPercent(usedPercentRaw)),
+        remainingPercent: Math.round(clampPercent(remainingPercent)),
+        limitWindowSeconds,
+        resetAfterSeconds,
+        resetAt
+      };
+    }
+
+    function normalizeProfileStats(payload) {
+      const source = payload?.stats || payload?.profile_stats || payload || {};
+      return {
+        username: payload?.username || source.username || "",
+        displayName: payload?.display_name || payload?.displayName || source.display_name || source.displayName || "",
+        statsAsOf: source.stats_as_of || source.statsAsOf || "",
+        generatedAt: localStamp(new Date()),
+        lifetimeTokens: source.lifetime_tokens ?? source.lifetimeTokens,
+        peakDailyTokens: source.peak_daily_tokens ?? source.peakDailyTokens,
+        currentStreakDays: source.current_streak_days ?? source.currentStreakDays,
+        longestStreakDays: source.longest_streak_days ?? source.longestStreakDays,
+        totalThreads: source.total_threads ?? source.totalThreads,
+        longestRunningTurnSec: source.longest_running_turn_sec ?? source.longestRunningTurnSec,
+        fastModeUsagePercentage: source.fast_mode_usage_percentage ?? source.fastModeUsagePercentage,
+        mostUsedReasoningEffort: source.most_used_reasoning_effort ?? source.mostUsedReasoningEffort,
+        mostUsedReasoningEffortPercentage: source.most_used_reasoning_effort_percentage ?? source.mostUsedReasoningEffortPercentage
+      };
+    }
+
+    function labelForWindow(seconds) {
+      if (seconds === 18000) return "5h";
+      if (seconds === 604800) return "7d";
+      return seconds ? `${Math.round(seconds / 3600)}h` : "limit";
+    }
+
+    function localStamp(value) {
+      if (!value) return "";
+      const date = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} • ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    }
 
     function renderTabs() {
       const root = document.getElementById("tabs");
@@ -1340,6 +1601,7 @@ function Write-CodexDashboardHtml {
           <div>
             <h2>${escapeHtml(label)}</h2>
             <p class="identity-line">${escapeHtml(handle)}${plan ? `<span class="plan">${escapeHtml(plan)}</span>` : ""}</p>
+            ${renderLiveNote(account)}
           </div>
           <div class="profile-stats">
             ${profileStat("Lifetime tokens", compactNumber(profile.lifetimeTokens))}
@@ -1385,7 +1647,7 @@ function Write-CodexDashboardHtml {
       const meta = `
         <div class="status-meta">
           <div>Account: <code>${escapeHtml(account.accountId || "")}</code></div>
-          <div>Token source: <code>${escapeHtml(account.tokenSource || "")}</code></div>
+          <div>Data source: <code>${escapeHtml(account.dataSource || account.tokenSource || "")}</code></div>
         </div>
       `;
 
@@ -1417,6 +1679,21 @@ function Write-CodexDashboardHtml {
           ${detail("Spend cap", spend.reached === true ? "Reached" : "Not reached")}
         </div>
       `;
+    }
+
+    function renderLiveNote(account) {
+      const suffix = account.lastPolledAt ? ` Last updated ${escapeHtml(account.lastPolledAt)}.` : "";
+      if (account.accountId === liveAuth.accountId) {
+        if (account.liveRefreshState === "refreshing") {
+          return `<p class="live-note">Refreshing live account data...${suffix}</p>`;
+        }
+        if (account.liveRefreshState === "failed") {
+          return `<p class="live-note">${escapeHtml(account.liveRefreshError || "Live refresh failed; showing cached data.")}${suffix}</p>`;
+        }
+        return `<p class="live-note">Live account. Refreshes every 30 seconds.${suffix}</p>`;
+      }
+
+      return `<p class="live-note">Cached account snapshot.${suffix}</p>`;
     }
 
     function renderProfileDetails(account, profile) {
@@ -1555,98 +1832,117 @@ function Write-CodexDashboardHtml {
 </html>
 '@
 
-  $html = $template.Replace("__RESET_DATA_JSON__", $json)
+  $liveAuthJson = ConvertTo-HtmlJson $LiveAuth
+  $html = $template.Replace("__RESET_DATA_JSON__", $json).Replace("__LIVE_AUTH_JSON__", $liveAuthJson)
   Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8NoBOM
 }
 
-if (-not $SkipSaveCurrent) {
-  Save-CurrentAccountAuth $AuthPath $AccountsDir
+New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+
+$liveAuth = [ordered]@{
+  accountId = $null
+  apiBase = $LiveApiBase.TrimEnd("/")
 }
-
-New-Item -ItemType Directory -Force -Path $AccountsDir | Out-Null
-
-$savedFiles = @(Get-ChildItem -LiteralPath $AccountsDir -Filter "*.auth.json" -File | Sort-Object LastWriteTimeUtc -Descending)
-$byAccount = @{}
-
-foreach ($file in $savedFiles) {
+$accountsById = @{}
+$cachedFiles = @(Get-ChildItem -LiteralPath $CacheDir -Filter "*.snapshot.json" -File -ErrorAction SilentlyContinue)
+foreach ($file in $cachedFiles) {
   try {
-    $auth = Read-JsonFile $file.FullName
-    $info = Get-AuthAccountInfo $auth $file.FullName
-    if (-not $byAccount.ContainsKey($info.accountId)) {
-      $byAccount[$info.accountId] = [pscustomobject]@{
-        auth = $auth
-        info = $info
-        file = $file
-      }
+    $cached = Read-JsonFile $file.FullName
+    if (-not [string]::IsNullOrWhiteSpace([string]$cached.accountId)) {
+      $cached | Add-Member -MemberType NoteProperty -Name "isLive" -Value $false -Force
+      $cached | Add-Member -MemberType NoteProperty -Name "dataSource" -Value "cached snapshot from $($file.Name)" -Force
+      $accountsById[$cached.accountId] = $cached
     }
   } catch {
-    Write-Warning "Skipping $($file.Name): $($_.Exception.Message)"
+    Write-Warning "Skipping cached snapshot $($file.Name): $($_.Exception.Message)"
   }
 }
 
-$accounts = @()
+if (-not $SkipSaveCurrent) {
+  try {
+    $activeAuth = Read-JsonFile $AuthPath
+    $info = Get-AuthAccountInfo $activeAuth $AuthPath
+    $liveAuth.accountId = $info.accountId
+    Write-Host "Querying live Codex account data for $(First-NonEmpty $info.email $info.accountId)..."
 
-foreach ($entry in ($byAccount.Values | Sort-Object { $_.info.email }, { $_.info.accountId })) {
-  $info = $entry.info
-  Write-Host "Querying Codex account data for $(First-NonEmpty $info.email $info.accountId)..."
-
-  $record = [ordered]@{
-    email = $info.email
-    name = $info.name
-    plan = $info.plan
-    accountId = $info.accountId
-    tokenSource = $entry.file.Name
-    accessTokenExpiresAt = $info.accessTokenExpiresAt
-    availableCount = 0
-    credits = @()
-    usageStatus = $null
-    profileStats = $null
-    resetCreditsError = $null
-    usageError = $null
-    profileError = $null
-    error = $null
-  }
-
-  if ($SkipFetch) {
-    $record.error = "Fetching was skipped."
-    $record.resetCreditsError = "Fetching was skipped."
-    $record.usageError = "Fetching was skipped."
-    $record.profileError = "Fetching was skipped."
-  } else {
-    try {
-      $resetCredits = Get-ResetCredits $info
-      $record.availableCount = $resetCredits.availableCount
-      $record.credits = $resetCredits.credits
-    } catch {
-      $record.resetCreditsError = $_.Exception.Message
+    $record = [ordered]@{
+      email = $info.email
+      name = $info.name
+      plan = $info.plan
+      accountId = $info.accountId
+      tokenSource = "~/.codex/auth.json"
+      dataSource = "live ~/.codex/auth.json"
+      isLive = $true
+      lastPolledAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      accessTokenExpiresAt = $info.accessTokenExpiresAt
+      availableCount = 0
+      credits = @()
+      usageStatus = $null
+      profileStats = $null
+      resetCreditsError = $null
+      usageError = $null
+      profileError = $null
+      error = $null
     }
 
-    try {
-      $usageStatus = Get-UsageStatus $info
-      $record.usageStatus = $usageStatus
-      if ($record.availableCount -eq 0) {
-        $usageResetCredits = Get-PropertyValue (Get-PropertyValue $usageStatus "rateLimitResetCredits") "availableCount"
-        if ($null -ne $usageResetCredits) {
-          $record.availableCount = [int]$usageResetCredits
+    if ($SkipFetch) {
+      $record.error = "Fetching was skipped."
+      $record.resetCreditsError = "Fetching was skipped."
+      $record.usageError = "Fetching was skipped."
+      $record.profileError = "Fetching was skipped."
+    } else {
+      try {
+        $resetCredits = Get-ResetCredits $info
+        $record.availableCount = $resetCredits.availableCount
+        $record.credits = $resetCredits.credits
+      } catch {
+        $record.resetCreditsError = Get-FriendlyAccountError $info $_.Exception.Message
+      }
+
+      try {
+        $usageStatus = Get-UsageStatus $info
+        $record.usageStatus = $usageStatus
+        if ($record.availableCount -eq 0) {
+          $usageResetCredits = Get-PropertyValue (Get-PropertyValue $usageStatus "rateLimitResetCredits") "availableCount"
+          if ($null -ne $usageResetCredits) {
+            $record.availableCount = [int]$usageResetCredits
+          }
         }
+      } catch {
+        $record.usageError = Get-FriendlyAccountError $info $_.Exception.Message
       }
-    } catch {
-      $record.usageError = $_.Exception.Message
+
+      try {
+        $profileStats = Get-ProfileStats $info
+        $record.profileStats = $profileStats
+        if ([string]::IsNullOrWhiteSpace([string]$record.name)) {
+          $record.name = $profileStats.displayName
+        }
+      } catch {
+        $record.profileError = Get-FriendlyAccountError $info $_.Exception.Message
+      }
     }
 
-    try {
-      $profileStats = Get-ProfileStats $info
-      $record.profileStats = $profileStats
-      if ([string]::IsNullOrWhiteSpace([string]$record.name)) {
-        $record.name = $profileStats.displayName
-      }
-    } catch {
-      $record.profileError = $_.Exception.Message
+    $liveRecord = [pscustomobject]$record
+    $accountsById[$info.accountId] = $liveRecord
+
+    $hasUsableLiveData = $null -ne $liveRecord.usageStatus -or $null -ne $liveRecord.profileStats -or $null -ne $liveRecord.credits
+    if ($hasUsableLiveData -and -not $SkipFetch) {
+      $identity = First-NonEmpty $liveRecord.email $liveRecord.name $liveRecord.accountId
+      $shortId = $liveRecord.accountId.Substring(0, [Math]::Min(8, $liveRecord.accountId.Length))
+      $cacheFile = Join-Path $CacheDir ("$(New-SafeFileStem "$identity-$shortId").snapshot.json")
+      $cacheRecord = [pscustomobject]$record
+      $cacheRecord | Add-Member -MemberType NoteProperty -Name "isLive" -Value $false -Force
+      $cacheRecord | Add-Member -MemberType NoteProperty -Name "dataSource" -Value "cached snapshot from last successful live poll" -Force
+      Write-JsonFile $cacheRecord $cacheFile
+      Write-Host "Updated cached snapshot for $(First-NonEmpty $liveRecord.email $liveRecord.accountId) at $cacheFile"
     }
+  } catch {
+    Write-Warning "Could not poll active auth file $AuthPath`: $($_.Exception.Message)"
   }
-
-  $accounts += [pscustomobject]$record
 }
+
+$accounts = @($accountsById.Values | Sort-Object { -not $_.isLive }, { $_.email }, { $_.accountId })
 
 $totalAvailable = 0
 foreach ($account in $accounts) {
@@ -1654,12 +1950,13 @@ foreach ($account in $accounts) {
 }
 
 $snapshot = [ordered]@{
-  generatedAt = (Get-Date).ToString("yyyy-MM-dd_HH:mm:ss")
-  source = "~/.codex/auth.json plus https://chatgpt.com/backend-api/wham/usage, /wham/profiles/me, and /wham/rate-limit-reset-credits"
-  accountsDir = ".codex-accounts"
+  generatedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+  timeZone = (Get-TimeZone).Id
+  source = "Live data for the active ~/.codex/auth.json account plus cached snapshots for other accounts."
+  accountsDir = ".codex-cache"
   totalAvailable = $totalAvailable
   accounts = $accounts
 }
 
-Write-CodexDashboardHtml $snapshot $OutputPath
-Write-Host "Wrote $OutputPath with $totalAvailable available reset credit(s) across $($accounts.Count) saved account(s)."
+Write-CodexDashboardHtml $snapshot $liveAuth $OutputPath
+Write-Host "Wrote $OutputPath with $totalAvailable available reset credit(s) across $($accounts.Count) account snapshot(s)."
