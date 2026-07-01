@@ -1403,47 +1403,58 @@ function Write-CodexDashboardHtml {
 
     function updateChromeText() {
       const total = accounts.reduce((sum, account) => sum + Number(account.availableCount || 0), 0);
-      document.getElementById("total").textContent = String(total);
+      const account = accounts[activeIndex] || accounts[0] || {};
+      const accountTotal = Number(account.availableCount || 0);
+      document.getElementById("total").textContent = String(accountTotal);
       document.getElementById("summary").textContent =
-        `${accounts.length} account snapshot${accounts.length === 1 ? "" : "s"} - ${total} reset ${total === 1 ? "credit" : "credits"} available.`;
+        `${accountTotal} reset ${accountTotal === 1 ? "credit" : "credits"} on selected account - ${total} total across ${accounts.length} account snapshot${accounts.length === 1 ? "" : "s"}.`;
     }
 
     async function refreshLiveAccount() {
-      if (!liveAuth || !liveAuth.apiBase || !liveAuth.accountId) return;
-      const index = accounts.findIndex((account) => account.accountId === liveAuth.accountId);
-      if (index < 0) return;
-
-      const account = accounts[index];
-      account.liveRefreshState = "refreshing";
-      if (index === activeIndex) renderAccount();
+      if (!liveAuth || !liveAuth.apiBase) return;
+      const previousLiveIndex = accounts.findIndex((account) => account.accountId === liveAuth.accountId);
+      const account = previousLiveIndex >= 0 ? accounts[previousLiveIndex] : accounts[activeIndex];
+      if (account) account.liveRefreshState = "refreshing";
+      if (previousLiveIndex === activeIndex) renderAccount();
 
       try {
-        const [credits, usage, profile] = await Promise.all([
-          fetchCodexJson("/backend-api/wham/rate-limit-reset-credits"),
-          fetchCodexJson("/backend-api/wham/usage"),
-          fetchCodexJson("/backend-api/wham/profiles/me")
-        ]);
+        const live = await fetchCodexJson("/codex-resets/live");
+        const liveAccount = live.account || live;
+        if (!liveAccount.accountId) throw new Error("Live response did not include accountId.");
 
-        applyLiveCredits(account, credits);
-        account.usageStatus = normalizeUsageStatus(usage);
-        account.profileStats = normalizeProfileStats(profile);
-        account.resetCreditsError = null;
-        account.usageError = null;
-        account.profileError = null;
-        account.error = null;
-        account.isLive = true;
-        account.dataSource = "live browser refresh";
-        account.lastPolledAt = localStamp(new Date());
-        account.liveRefreshState = "ok";
-        account.liveRefreshError = null;
+        const index = upsertAccount(liveAccount);
+        liveAuth.accountId = liveAccount.accountId;
+        accounts.forEach((entry, entryIndex) => {
+          entry.isLive = entryIndex === index;
+          if (entryIndex !== index && entry.dataSource === "live local proxy") {
+            entry.dataSource = "cached snapshot";
+          }
+        });
+        accounts[index].liveRefreshState = "ok";
+        accounts[index].liveRefreshError = null;
       } catch (error) {
-        account.liveRefreshState = "failed";
-        account.liveRefreshError = `Live browser refresh failed; showing cached data. ${error.message || error}`;
+        const failedIndex = accounts.findIndex((entry) => entry.accountId === liveAuth.accountId);
+        const failedAccount = failedIndex >= 0 ? accounts[failedIndex] : accounts[activeIndex];
+        if (failedAccount) {
+          failedAccount.liveRefreshState = "failed";
+          failedAccount.liveRefreshError = `Live browser refresh failed; showing cached data. ${error.message || error}`;
+        }
       }
 
       updateChromeText();
       renderTabs();
-      if (index === activeIndex) renderAccount();
+      renderAccount();
+    }
+
+    function upsertAccount(nextAccount) {
+      const index = accounts.findIndex((account) => account.accountId === nextAccount.accountId);
+      if (index >= 0) {
+        accounts[index] = { ...accounts[index], ...nextAccount };
+        return index;
+      }
+
+      accounts.push(nextAccount);
+      return accounts.length - 1;
     }
 
     async function fetchCodexJson(path) {
@@ -1575,6 +1586,7 @@ function Write-CodexDashboardHtml {
       for (const button of root.querySelectorAll(".tab")) {
         button.addEventListener("click", () => {
           activeIndex = Number(button.dataset.index || 0);
+          updateChromeText();
           renderTabs();
           renderAccount();
         });
@@ -1668,6 +1680,7 @@ function Write-CodexDashboardHtml {
       const reached = usage.limitReached === true ? "Limit reached" : "Within limits";
       const credits = usage.credits || {};
       const spend = usage.spendControl || {};
+      const resetBalance = usage.rateLimitResetCredits?.availableCount ?? account.availableCount ?? "--";
 
       return `
         ${meta}
@@ -1675,7 +1688,7 @@ function Write-CodexDashboardHtml {
         <div class="detail-grid">
           ${detail("Access", allowed)}
           ${detail("Limit state", reached)}
-          ${detail("Credit balance", credits.balance ?? "--")}
+          ${detail("Reset balance", resetBalance)}
           ${detail("Spend cap", spend.reached === true ? "Reached" : "Not reached")}
         </div>
       `;
