@@ -2,7 +2,7 @@
 
 A self-contained local dashboard for checking Codex reset credits, current usage windows, and profile stats across one or more Codex accounts.
 
-![Redacted dashboard screenshot](./dashboard-screenshot.png)
+![Redacted dashboard screenshot](./dashboard.png)
 
 ## Features
 
