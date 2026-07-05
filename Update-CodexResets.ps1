@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
   [string]$AuthPath = (Join-Path $HOME ".codex\auth.json"),
-  [string]$CacheDir = (Join-Path $PSScriptRoot ".codex-cache"),
-  [string]$OutputPath = (Join-Path $PSScriptRoot "index.html"),
+  [string]$CacheDir,
+  [string]$OutputPath,
   [string]$LiveApiBase = "http://127.0.0.1:8787",
   [switch]$SkipSaveCurrent,
   [switch]$SkipFetch
@@ -11,6 +11,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+$ScriptRoot = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+  $PSScriptRoot
+} elseif (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+  Split-Path -Parent $PSCommandPath
+} else {
+  (Get-Location).Path
+}
+if ([string]::IsNullOrWhiteSpace($CacheDir)) {
+  $CacheDir = Join-Path $ScriptRoot ".codex-cache"
+}
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+  $OutputPath = Join-Path $ScriptRoot "index.html"
+}
 
 function ConvertFrom-JsonWithStringDates {
   param([Parameter(Mandatory = $true)][string]$Json)
@@ -43,6 +57,15 @@ function Write-JsonFile {
 
   $json = $Value | ConvertTo-Json @jsonArgs
   Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+}
+
+function Write-Utf8NoBomFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Value
+  )
+
+  [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
 }
 
 function Get-PropertyValue {
@@ -114,7 +137,7 @@ function Convert-ToLocalStamp {
     )
   }
 
-  return $date.LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
+  return Format-LocalStamp $date.LocalDateTime
 }
 
 function Convert-UnixSecondsToLocalStamp {
@@ -124,7 +147,13 @@ function Convert-UnixSecondsToLocalStamp {
     return $null
   }
 
-  return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
+  return Format-LocalStamp ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime
+}
+
+function Format-LocalStamp {
+  param([Parameter(Mandatory = $true)][DateTime]$Date)
+
+  return "{0} {1} {2}" -f $Date.ToString("yyyy-MM-dd"), [char]0x2022, $Date.ToString("HH:mm:ss")
 }
 
 function New-SafeFileStem {
@@ -492,8 +521,8 @@ function ConvertTo-HtmlJson {
     Replace("&", "\u0026").
     Replace("<", "\u003c").
     Replace(">", "\u003e").
-    Replace([char]0x2028, "\u2028").
-    Replace([char]0x2029, "\u2029")
+    Replace([string][char]0x2028, "\u2028").
+    Replace([string][char]0x2029, "\u2029")
 }
 
 function Write-ResetHtml {
@@ -892,7 +921,7 @@ function Write-ResetHtml {
 '@
 
   $html = $template.Replace("__RESET_DATA_JSON__", $json)
-  Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8NoBOM
+  Write-Utf8NoBomFile -Path $OutputPath -Value $html
 }
 
 function Write-CodexDashboardHtml {
@@ -1882,7 +1911,7 @@ function Write-CodexDashboardHtml {
       const date = value instanceof Date ? value : new Date(value);
       if (Number.isNaN(date.getTime())) return String(value);
       const pad = (n) => String(n).padStart(2, "0");
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} • ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} \u2022 ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
     }
 
     function renderTabs() {
@@ -2003,7 +2032,7 @@ function Write-CodexDashboardHtml {
             <div class="track" aria-label="${escapeHtml(window.label || "limit")} remaining">
               <div class="fill" style="width:${remaining}%"></div>
             </div>
-            <div class="limit-value">${remaining}% left <span class="separator">•</span> <span class="used">${used}% used</span> <span>(resets ${escapeHtml(window.resetAt || "")})</span></div>
+            <div class="limit-value">${remaining}% left <span class="separator">&#8226;</span> <span class="used">${used}% used</span> <span>(resets ${escapeHtml(window.resetAt || "")})</span></div>
           </div>
         `;
       }).join("");
@@ -2587,15 +2616,15 @@ function Write-CodexDashboardHtml {
       if (start == null || end == null) return "--";
       const delta = Number(end) - Number(start);
       const sign = delta > 0 ? "+" : "";
-      return `${Number(start).toFixed(0)}% → ${Number(end).toFixed(0)}% (${sign}${delta.toFixed(0)})`;
+      return `${Number(start).toFixed(0)}% \u2192 ${Number(end).toFixed(0)}% (${sign}${delta.toFixed(0)})`;
     }
 
     function sessionRange(session) {
       const start = String(session.start || "");
       const end = String(session.end || "");
       if (!start && !end) return "--";
-      const endTime = end.includes(" • ") ? end.split(" • ").pop() : end;
-      return `${start || "--"} → ${endTime || "--"}`;
+      const endTime = end.includes(" \u2022 ") ? end.split(" \u2022 ").pop() : end;
+      return `${start || "--"} \u2192 ${endTime || "--"}`;
     }
 
     function sessionDuration(session) {
@@ -2648,6 +2677,7 @@ function Write-CodexDashboardHtml {
             const modelShare = Number(model.turns || 0) / modelTurnTotal;
             return {
               model: model.model || model.name || "Estimated",
+              pending: Boolean(model.pending),
               tokens: Number(bucket.tokens || 0) * share * modelShare,
               threads: Number(model.threads ?? bucket.threads ?? 0) * share,
               turns: Number(model.turns || 0) * share
@@ -2666,17 +2696,17 @@ function Write-CodexDashboardHtml {
       const tokens = Number(session.tokensUsed || 0);
       if (tokens > 0) return compactNumber(tokens);
       const estimate = estimates?.get(sessionKey(session));
-      if (estimate?.tokens > 0) return `≈${compactNumber(estimate.tokens)}`;
-      return sessionUsageMoved(session) ? "≈0" : "0";
+      if (estimate?.tokens > 0) return `\u2248${compactNumber(estimate.tokens)}`;
+      return sessionUsageMoved(session) ? "\u22480" : "0";
     }
 
     function sessionThreads(session, estimates) {
       const threads = Number(session.threadDelta || 0);
       if (threads > 0) return integer(threads);
       const estimate = estimates?.get(sessionKey(session));
-      if (estimate?.threads > 0) return `≈${number(estimate.threads, 1)}`;
-      if (estimate?.turns > 0) return `≈${number(estimate.turns, 1)} turns`;
-      return sessionUsageMoved(session) ? "≈0" : "0";
+      if (estimate?.threads > 0) return `\u2248${number(estimate.threads, 1)}`;
+      if (estimate?.turns > 0) return `\u2248${number(estimate.turns, 1)} turns`;
+      return sessionUsageMoved(session) ? "\u22480" : "0";
     }
 
     function sessionModelSummary(session, estimates) {
@@ -2688,7 +2718,11 @@ function Write-CodexDashboardHtml {
       return models
         .slice()
         .sort((a, b) => Number(b.turns || 0) - Number(a.turns || 0))
-        .map((model) => `${model.model} ${Math.round((Number(model.turns || 0) / totalTurns) * 100)}%`)
+        .map((model) => {
+          const label = model.model || "Estimated";
+          const percent = Math.round((Number(model.turns || 0) / totalTurns) * 100);
+          return percent === 100 ? label : `${label} ${percent}%`;
+        })
         .join(" / ");
     }
 
@@ -2699,12 +2733,12 @@ function Write-CodexDashboardHtml {
       if (!Number.isFinite(start) || !Number.isFinite(end)) return "--";
       const delta = end - start;
       const sign = delta > 0 ? "+" : "";
-      return `${start} → ${end} (${sign}${delta})`;
+      return `${start} \u2192 ${end} (${sign}${delta})`;
     }
 
     function parseLocalStamp(value) {
       if (!value) return null;
-      const normalized = String(value).replace(" • ", "T");
+      const normalized = String(value).replace(" \u2022 ", "T");
       const date = new Date(normalized);
       return Number.isNaN(date.getTime()) ? null : date;
     }
@@ -2801,7 +2835,7 @@ function Write-CodexDashboardHtml {
 
   $liveAuthJson = ConvertTo-HtmlJson $LiveAuth
   $html = $template.Replace("__RESET_DATA_JSON__", $json).Replace("__LIVE_AUTH_JSON__", $liveAuthJson)
-  Set-Content -LiteralPath $OutputPath -Value $html -Encoding utf8NoBOM
+  Write-Utf8NoBomFile -Path $OutputPath -Value $html
 }
 
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
@@ -2841,7 +2875,7 @@ if (-not $SkipSaveCurrent) {
       tokenSource = "~/.codex/auth.json"
       dataSource = "live ~/.codex/auth.json"
       isLive = $true
-      lastPolledAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      lastPolledAt = Format-LocalStamp (Get-Date)
       accessTokenExpiresAt = $info.accessTokenExpiresAt
       availableCount = 0
       credits = @()
@@ -2925,7 +2959,7 @@ foreach ($account in $accounts) {
 }
 
 $snapshot = [ordered]@{
-  generatedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+  generatedAt = Format-LocalStamp (Get-Date)
   timeZone = (Get-TimeZone).Id
   source = "Live data for the active ~/.codex/auth.json account plus cached snapshots for other accounts."
   accountsDir = ".codex-cache"

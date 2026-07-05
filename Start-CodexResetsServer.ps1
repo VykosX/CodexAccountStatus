@@ -2,13 +2,27 @@
 param(
   [int]$Port = 8787,
   [string]$AuthPath = (Join-Path $HOME ".codex\auth.json"),
-  [string]$Root = $PSScriptRoot,
-  [string]$CacheDir = (Join-Path $PSScriptRoot ".codex-cache")
+  [string]$Root,
+  [string]$CacheDir
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+$ScriptRoot = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+  $PSScriptRoot
+} elseif (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+  Split-Path -Parent $PSCommandPath
+} else {
+  (Get-Location).Path
+}
+if ([string]::IsNullOrWhiteSpace($Root)) {
+  $Root = $ScriptRoot
+}
+if ([string]::IsNullOrWhiteSpace($CacheDir)) {
+  $CacheDir = Join-Path $ScriptRoot ".codex-cache"
+}
 
 function ConvertFrom-JsonWithStringDates {
   param([Parameter(Mandatory = $true)][string]$Json)
@@ -94,7 +108,7 @@ function Convert-ToLocalStamp {
     )
   }
 
-  return $date.LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
+  return Format-LocalStamp $date.LocalDateTime
 }
 
 function Convert-UnixSecondsToLocalStamp {
@@ -104,7 +118,13 @@ function Convert-UnixSecondsToLocalStamp {
     return $null
   }
 
-  return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime.ToString("yyyy-MM-dd • HH:mm:ss")
+  return Format-LocalStamp ([DateTimeOffset]::FromUnixTimeSeconds([int64]$Seconds)).LocalDateTime
+}
+
+function Format-LocalStamp {
+  param([Parameter(Mandatory = $true)][DateTime]$Date)
+
+  return "{0} {1} {2}" -f $Date.ToString("yyyy-MM-dd"), [char]0x2022, $Date.ToString("HH:mm:ss")
 }
 
 function New-SafeFileStem {
@@ -146,7 +166,17 @@ function ConvertTo-HtmlJson {
     $jsonArgs.EscapeHandling = "EscapeHtml"
   }
 
-  return $Value | ConvertTo-Json @jsonArgs
+  $json = $Value | ConvertTo-Json @jsonArgs
+  if ($jsonArgs.ContainsKey("EscapeHandling")) {
+    return $json
+  }
+
+  return $json.
+    Replace("&", "\u0026").
+    Replace("<", "\u003c").
+    Replace(">", "\u003e").
+    Replace([string][char]0x2028, "\u2028").
+    Replace([string][char]0x2029, "\u2029")
 }
 
 function ConvertFrom-Base64Url {
@@ -339,7 +369,7 @@ function Convert-ProfileStats {
     username = Get-PropertyValue $profile "username"
     displayName = Get-PropertyValue $profile "display_name"
     statsAsOf = $statsAsOf
-    generatedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+    generatedAt = Format-LocalStamp (Get-Date)
     lifetimeTokens = Get-PropertyValue $stats "lifetime_tokens"
     peakDailyTokens = Get-PropertyValue $stats "peak_daily_tokens"
     currentStreakDays = Get-PropertyValue $stats "current_streak_days"
@@ -393,7 +423,7 @@ function Get-CodexAnalyticsUsage {
     return Convert-CodexAnalyticsUsage (ConvertFrom-JsonWithStringDates (Invoke-CodexProxy $path)) $path
   } catch {
     return [pscustomobject]@{
-      fetchedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      fetchedAt = Format-LocalStamp (Get-Date)
       path = $path
       groupBy = $GroupBy
       rows = @()
@@ -478,7 +508,7 @@ function Convert-CodexAnalyticsUsage {
   }
 
   return [pscustomobject]@{
-    fetchedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+    fetchedAt = Format-LocalStamp (Get-Date)
     path = $Path
     groupBy = First-NonEmpty (Get-PropertyValue $Json "group_by") "day"
     rows = @($rows)
@@ -504,7 +534,7 @@ function Get-LiveAccountSnapshot {
     tokenSource = "~/.codex/auth.json"
     dataSource = "live local proxy"
     isLive = $true
-    lastPolledAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+    lastPolledAt = Format-LocalStamp (Get-Date)
     accessTokenExpiresAt = $active.accessTokenExpiresAt
     availableCount = $resetCredits.availableCount
     credits = $resetCredits.credits
@@ -550,7 +580,7 @@ function Convert-HistoryStampToDateTime {
     return $null
   }
 
-  $text = ([string]$Value).Replace(" • ", " ")
+  $text = ([string]$Value).Replace((" {0} " -f [char]0x2022), " ")
   $styles = [Globalization.DateTimeStyles]::AssumeLocal
   $parsed = [DateTime]::MinValue
   if ([DateTime]::TryParseExact($text, "yyyy-MM-dd HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
@@ -656,7 +686,7 @@ function Update-AccountHistory {
     $history = [pscustomobject]@{
       accountId = $Account.accountId
       email = $Account.email
-      createdAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      createdAt = Format-LocalStamp (Get-Date)
       updatedAt = $null
       samples = @()
       sessions = @()
@@ -755,7 +785,7 @@ function Get-CachedDashboardSnapshot {
   }
 
   return [ordered]@{
-    generatedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+    generatedAt = Format-LocalStamp (Get-Date)
     timeZone = (Get-TimeZone).Id
     source = "Live data for the active ~/.codex/auth.json account plus cached snapshots for other accounts."
     accountsDir = ".codex-cache"
