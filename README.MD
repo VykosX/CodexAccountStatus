@@ -20,7 +20,8 @@ A self-contained local dashboard for checking Codex reset credits, current usage
 
 ## Files
 
-- `CodexResets.ps1`: Starts the local browser/proxy server, refreshes the active Codex account, updates caches/history, and regenerates `index.html` when needed.
+- `CodexAccountStatus.ps1`: Windows version of the script. Starts the local browser/proxy server, refreshes the active Codex account, updates caches/history, and regenerates `index.html` when needed.
+- `CodexAccountStatus.sh`: Self-contained Linux/macOS Bash version performing the same as above. It uses Python 3 plus the Codex auth cache at `$CODEX_HOME/auth.json` or `~/.codex/auth.json`.
 - `index.html`: The generated self-contained dashboard.
 - `.codex-cache/`: Local cached account snapshots from successful live polls. This directory is ignored by git.
 - `.codex-cache/history/`: Local per-account history files with successful polling samples, inferred sessions, and analytics usage rows. This directory is ignored by git.
@@ -54,10 +55,18 @@ Daily Entries use the original per-model row layout. The analytics endpoint curr
 
 ## Usage
 
-Run from this project directory:
+Use the script for your OS from this project directory.
+
+Windows PowerShell:
 
 ```powershell
-.\CodexResets.ps1
+.\CodexAccountStatus.ps1
+```
+
+Linux or macOS:
+
+```bash
+./CodexAccountStatus.sh
 ```
 
 The script refreshes or creates the local cache and `index.html` if they are missing, starts the local proxy server, and opens the dashboard in your default browser:
@@ -69,17 +78,29 @@ http://127.0.0.1:8787/index.html
 Use update-only mode when you only want to refresh the cached data and regenerate `index.html` without starting the server:
 
 ```powershell
-.\CodexResets.ps1 -Update
+.\CodexAccountStatus.ps1 -Update
+```
+
+```bash
+./CodexAccountStatus.sh -Update
 ```
 
 The generated page refreshes the active account every 30 seconds while it is open. After switching Codex accounts, refresh the page or let the next 30-second poll run; the local server will detect the active account, update or create that account's tab, and save its latest snapshot/history.
 
 To add new accounts simply sign into them in Codex with the server running and wait for the server to refresh the active account automatically. Each account appears as a tab after the script successfully polls it at least once and writes a cached snapshot.
 
+On Linux, sign in with Codex CLI first:
+
+```bash
+codex login
+```
+
+On macOS, the shell script uses the same Codex auth cache path as the CLI and Codex app when file-based credential storage is enabled. Codex stores local state under `CODEX_HOME`, defaulting to `~/.codex`; file-based credentials are stored at `$CODEX_HOME/auth.json`.
+
 ## Script Options
 
 ```powershell
-.\CodexResets.ps1 `
+.\CodexAccountStatus.ps1 `
   -AuthPath "$HOME\.codex\auth.json" `
   -CacheDir ".\.codex-cache" `
   -Port 8787
@@ -92,6 +113,12 @@ To add new accounts simply sign into them in Codex with the server running and w
 - `-Update`: Refresh live data, regenerate `index.html`, and exit without starting the server.
 - `-SkipBrowser`: Start the server without opening the default browser.
 
+Bash uses the same option names:
+
+```bash
+./CodexAccountStatus.sh -AuthPath "$HOME/.codex/auth.json" -CacheDir ./.codex-cache -Port 8787
+```
+
 ## Privacy And Security
 
 The `.codex-cache/` directory contains personal account telemetry. Keep it private and do not commit or share it.
@@ -100,8 +127,9 @@ The `.codex-cache/` directory contains personal account telemetry. Keep it priva
 
 ## Troubleshooting
 
-If an account tab only shows cached data, switch Codex to that account and rerun `.\CodexResets.ps1 -Update`.
+If an account tab only shows cached data, switch Codex to that account and rerun `.\CodexAccountStatus.ps1 -Update`.
 
 If the live browser refresh fails, the page keeps showing the cached snapshot from the last successful script poll.
 
 If PowerShell blocks script execution, run the script from a PowerShell session that allows local scripts, or invoke it with an appropriate execution policy for your machine.
+
