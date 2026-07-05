@@ -48,6 +48,33 @@ function First-NonEmpty {
   return $null
 }
 
+function ConvertTo-Number {
+  param(
+    [Parameter(Mandatory = $false)]$Value,
+    [double]$Default = 0
+  )
+
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+    return $Default
+  }
+
+  try {
+    return [double]$Value
+  } catch {
+    return $Default
+  }
+}
+
+function Add-NumberProperty {
+  param(
+    [Parameter(Mandatory = $true)]$Target,
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $false)]$Value
+  )
+
+  $Target.$Name = (ConvertTo-Number $Target.$Name) + (ConvertTo-Number $Value)
+}
+
 function Convert-ToLocalStamp {
   param([Parameter(Mandatory = $false)]$Value)
 
@@ -322,6 +349,12 @@ function Convert-ProfileStats {
     fastModeUsagePercentage = Get-PropertyValue $stats "fast_mode_usage_percentage"
     mostUsedReasoningEffort = Get-PropertyValue $stats "most_used_reasoning_effort"
     mostUsedReasoningEffortPercentage = Get-PropertyValue $stats "most_used_reasoning_effort_percentage"
+    dailyUsageBuckets = @($dailyUsageBuckets | ForEach-Object {
+      [pscustomobject]@{
+        date = Get-PropertyValue $_ "start_date"
+        tokens = Get-PropertyValue $_ "tokens"
+      }
+    })
   }
 }
 
@@ -346,11 +379,122 @@ function Convert-ResetCredits {
   }
 }
 
+function Get-CodexAnalyticsUsage {
+  param(
+    [int]$Days = 30,
+    [string]$GroupBy = "day"
+  )
+
+  $end = (Get-Date).Date.AddDays(1)
+  $start = $end.AddDays(-[Math]::Max(1, $Days))
+  $path = "/backend-api/wham/analytics/daily-workspace-usage-counts?start_date=$($start.ToString("yyyy-MM-dd"))&end_date=$($end.ToString("yyyy-MM-dd"))&group_by=$GroupBy"
+
+  try {
+    return Convert-CodexAnalyticsUsage (ConvertFrom-JsonWithStringDates (Invoke-CodexProxy $path)) $path
+  } catch {
+    return [pscustomobject]@{
+      fetchedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      path = $path
+      groupBy = $GroupBy
+      rows = @()
+      modelBreakdown = @()
+      surfaceBreakdown = @()
+      totals = [pscustomobject]@{}
+      error = $_.Exception.Message
+    }
+  }
+}
+
+function Convert-CodexAnalyticsUsage {
+  param(
+    [Parameter(Mandatory = $true)]$Json,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  $modelTotals = @{}
+  $surfaceTotals = @{}
+  $summary = [ordered]@{
+    users = 0
+    threads = 0
+    turns = 0
+    credits = 0
+    uncachedTextInputTokens = 0
+    cachedTextInputTokens = 0
+    textOutputTokens = 0
+    textTotalTokens = 0
+  }
+
+  $rows = @(Get-PropertyValue $Json "data") | ForEach-Object {
+    $totals = Get-PropertyValue $_ "totals"
+    foreach ($pair in @(
+      @("users", "users"),
+      @("threads", "threads"),
+      @("turns", "turns"),
+      @("credits", "credits"),
+      @("uncachedTextInputTokens", "uncached_text_input_tokens"),
+      @("cachedTextInputTokens", "cached_text_input_tokens"),
+      @("textOutputTokens", "text_output_tokens"),
+      @("textTotalTokens", "text_total_tokens")
+    )) {
+      Add-NumberProperty $summary $pair[0] (Get-PropertyValue $totals $pair[1])
+    }
+
+    foreach ($client in @(Get-PropertyValue $_ "clients")) {
+      $name = First-NonEmpty (Get-PropertyValue $client "client_id") "Unknown"
+      if (-not $surfaceTotals.ContainsKey($name)) {
+        $surfaceTotals[$name] = [ordered]@{ name = $name; users = 0; threads = 0; turns = 0; credits = 0; tokens = 0 }
+      }
+      Add-NumberProperty $surfaceTotals[$name] "users" (Get-PropertyValue $client "users")
+      Add-NumberProperty $surfaceTotals[$name] "threads" (Get-PropertyValue $client "threads")
+      Add-NumberProperty $surfaceTotals[$name] "turns" (Get-PropertyValue $client "turns")
+      Add-NumberProperty $surfaceTotals[$name] "credits" (Get-PropertyValue $client "credits")
+      Add-NumberProperty $surfaceTotals[$name] "tokens" (Get-PropertyValue $client "text_total_tokens")
+    }
+
+    foreach ($model in @(Get-PropertyValue $_ "models")) {
+      $name = First-NonEmpty (Get-PropertyValue $model "model") "Unknown"
+      if (-not $modelTotals.ContainsKey($name)) {
+        $modelTotals[$name] = [ordered]@{ name = $name; users = 0; threads = 0; turns = 0; credits = 0; tokens = 0 }
+      }
+      Add-NumberProperty $modelTotals[$name] "users" (Get-PropertyValue $model "users")
+      Add-NumberProperty $modelTotals[$name] "threads" (Get-PropertyValue $model "threads")
+      Add-NumberProperty $modelTotals[$name] "turns" (Get-PropertyValue $model "turns")
+      Add-NumberProperty $modelTotals[$name] "credits" (Get-PropertyValue $model "credits")
+    }
+
+    [pscustomobject]@{
+      date = Get-PropertyValue $_ "date"
+      users = ConvertTo-Number (Get-PropertyValue $totals "users")
+      threads = ConvertTo-Number (Get-PropertyValue $totals "threads")
+      turns = ConvertTo-Number (Get-PropertyValue $totals "turns")
+      credits = ConvertTo-Number (Get-PropertyValue $totals "credits")
+      uncachedTextInputTokens = ConvertTo-Number (Get-PropertyValue $totals "uncached_text_input_tokens")
+      cachedTextInputTokens = ConvertTo-Number (Get-PropertyValue $totals "cached_text_input_tokens")
+      textOutputTokens = ConvertTo-Number (Get-PropertyValue $totals "text_output_tokens")
+      tokens = ConvertTo-Number (Get-PropertyValue $totals "text_total_tokens")
+      clients = @(Get-PropertyValue $_ "clients")
+      models = @(Get-PropertyValue $_ "models")
+    }
+  }
+
+  return [pscustomobject]@{
+    fetchedAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+    path = $Path
+    groupBy = First-NonEmpty (Get-PropertyValue $Json "group_by") "day"
+    rows = @($rows)
+    modelBreakdown = @($modelTotals.Values | Sort-Object { -1 * (ConvertTo-Number $_.turns) }, { $_.name })
+    surfaceBreakdown = @($surfaceTotals.Values | Sort-Object { -1 * (ConvertTo-Number $_.turns) }, { $_.name })
+    totals = [pscustomobject]$summary
+    error = $null
+  }
+}
+
 function Get-LiveAccountSnapshot {
   $active = Get-ActiveCodexAuth
   $usage = Convert-UsageStatus (ConvertFrom-JsonWithStringDates (Invoke-CodexProxy "/backend-api/wham/usage"))
   $profile = Convert-ProfileStats (ConvertFrom-JsonWithStringDates (Invoke-CodexProxy "/backend-api/wham/profiles/me"))
   $resetCredits = Convert-ResetCredits (ConvertFrom-JsonWithStringDates (Invoke-CodexProxy "/backend-api/wham/rate-limit-reset-credits"))
+  $analytics = Get-CodexAnalyticsUsage 30 "day"
 
   $record = [pscustomobject]@{
     email = $active.email
@@ -372,6 +516,8 @@ function Get-LiveAccountSnapshot {
     error = $null
   }
 
+  $record | Add-Member -MemberType NoteProperty -Name "history" -Value (Update-AccountHistory $record $analytics) -Force
+
   New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
   $identity = First-NonEmpty $record.email $record.name $record.accountId
   $shortId = $record.accountId.Substring(0, [Math]::Min(8, $record.accountId.Length))
@@ -387,6 +533,191 @@ function Get-LiveAccountSnapshot {
   }
 }
 
+function Get-HistoryPath {
+  param([Parameter(Mandatory = $true)]$Account)
+
+  $historyDir = Join-Path $CacheDir "history"
+  New-Item -ItemType Directory -Force -Path $historyDir | Out-Null
+  $identity = First-NonEmpty $Account.email $Account.name $Account.accountId
+  $shortId = $Account.accountId.Substring(0, [Math]::Min(8, $Account.accountId.Length))
+  return Join-Path $historyDir ("$(New-SafeFileStem "$identity-$shortId").history.json")
+}
+
+function Convert-HistoryStampToDateTime {
+  param([Parameter(Mandatory = $false)]$Value)
+
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+    return $null
+  }
+
+  $text = ([string]$Value).Replace(" • ", " ")
+  $styles = [Globalization.DateTimeStyles]::AssumeLocal
+  $parsed = [DateTime]::MinValue
+  if ([DateTime]::TryParseExact($text, "yyyy-MM-dd HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+    return $parsed
+  }
+
+  if ([DateTime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+    return $parsed
+  }
+
+  return $null
+}
+
+function Convert-SamplesToSessions {
+  param([Parameter(Mandatory = $true)]$Samples)
+
+  $sessions = @()
+  $current = $null
+  $idleLimitMinutes = 5
+  $orderedSamples = @($Samples | Sort-Object { Convert-HistoryStampToDateTime (Get-PropertyValue $_ "at") })
+  for ($i = 1; $i -lt $orderedSamples.Count; $i++) {
+    $previous = $orderedSamples[$i - 1]
+    $sample = $orderedSamples[$i]
+    $previousAt = Convert-HistoryStampToDateTime (Get-PropertyValue $previous "at")
+    $sampleAt = Convert-HistoryStampToDateTime (Get-PropertyValue $sample "at")
+    if ($null -eq $previousAt -or $null -eq $sampleAt) {
+      continue
+    }
+
+    $minutesSinceLastSample = ($sampleAt - $previousAt).TotalMinutes
+    $tokenDelta = [int64](First-NonEmpty (Get-PropertyValue $sample "lifetimeTokens") 0) - [int64](First-NonEmpty (Get-PropertyValue $previous "lifetimeTokens") 0)
+    $threadDelta = [int64](First-NonEmpty (Get-PropertyValue $sample "totalThreads") 0) - [int64](First-NonEmpty (Get-PropertyValue $previous "totalThreads") 0)
+    $primaryDelta = [double](First-NonEmpty (Get-PropertyValue $sample "primaryUsedPercent") 0) - [double](First-NonEmpty (Get-PropertyValue $previous "primaryUsedPercent") 0)
+    $secondaryDelta = [double](First-NonEmpty (Get-PropertyValue $sample "secondaryUsedPercent") 0) - [double](First-NonEmpty (Get-PropertyValue $previous "secondaryUsedPercent") 0)
+    $usageReduced = $tokenDelta -lt 0 -or $threadDelta -lt 0 -or $primaryDelta -lt 0 -or $secondaryDelta -lt 0
+    $hasWork = -not $usageReduced -and ($tokenDelta -gt 0 -or $threadDelta -gt 0 -or $primaryDelta -gt 0 -or $secondaryDelta -gt 0)
+
+    if ($usageReduced -or $minutesSinceLastSample -gt $idleLimitMinutes) {
+      if ($null -ne $current) {
+        $sessions += [pscustomobject]$current
+        $current = $null
+      }
+      continue
+    }
+
+    if (-not $hasWork) {
+      continue
+    }
+
+    if ($null -eq $current) {
+      $current = [ordered]@{
+        start = Get-PropertyValue $previous "at"
+        end = Get-PropertyValue $sample "at"
+        tokensUsed = 0
+        threadDelta = 0
+        primaryUsedPercentStart = Get-PropertyValue $previous "primaryUsedPercent"
+        primaryUsedPercentEnd = Get-PropertyValue $sample "primaryUsedPercent"
+        secondaryUsedPercentStart = Get-PropertyValue $previous "secondaryUsedPercent"
+        secondaryUsedPercentEnd = Get-PropertyValue $sample "secondaryUsedPercent"
+        resetCreditsStart = Get-PropertyValue $previous "availableResetCredits"
+        resetCreditsEnd = Get-PropertyValue $sample "availableResetCredits"
+        model = First-NonEmpty (Get-PropertyValue $sample "model") "Unknown"
+        surface = First-NonEmpty (Get-PropertyValue $sample "surface") "Local proxy"
+        reasoning = Get-PropertyValue $sample "mostUsedReasoningEffort"
+        sampleCount = 1
+      }
+    }
+
+    $current.end = Get-PropertyValue $sample "at"
+    $current.tokensUsed += [Math]::Max(0, $tokenDelta)
+    $current.threadDelta += [Math]::Max(0, $threadDelta)
+    $current.primaryUsedPercentEnd = Get-PropertyValue $sample "primaryUsedPercent"
+    $current.secondaryUsedPercentEnd = Get-PropertyValue $sample "secondaryUsedPercent"
+    $current.resetCreditsEnd = Get-PropertyValue $sample "availableResetCredits"
+    $current.reasoning = First-NonEmpty (Get-PropertyValue $sample "mostUsedReasoningEffort") $current.reasoning
+    $current.sampleCount += 1
+  }
+
+  if ($null -ne $current) {
+    $sessions += [pscustomobject]$current
+  }
+
+  return @($sessions)
+}
+
+function Update-AccountHistory {
+  param(
+    [Parameter(Mandatory = $true)]$Account,
+    [Parameter(Mandatory = $false)]$Analytics
+  )
+
+  $historyPath = Get-HistoryPath $Account
+  $history = $null
+  if (Test-Path -LiteralPath $historyPath) {
+    try {
+      $history = ConvertFrom-JsonWithStringDates (Get-Content -LiteralPath $historyPath -Raw)
+    } catch {
+      $history = $null
+    }
+  }
+
+  if ($null -eq $history) {
+    $history = [pscustomobject]@{
+      accountId = $Account.accountId
+      email = $Account.email
+      createdAt = (Get-Date).ToString("yyyy-MM-dd • HH:mm:ss")
+      updatedAt = $null
+      samples = @()
+      sessions = @()
+      analytics = $null
+    }
+  }
+
+  $primary = @($Account.usageStatus.windows | Where-Object { $_.kind -eq "primary" } | Select-Object -First 1)
+  $secondary = @($Account.usageStatus.windows | Where-Object { $_.kind -eq "secondary" } | Select-Object -First 1)
+  $sample = [pscustomobject]@{
+    at = $Account.lastPolledAt
+    availableResetCredits = $Account.availableCount
+    lifetimeTokens = $Account.profileStats.lifetimeTokens
+    totalThreads = $Account.profileStats.totalThreads
+    primaryUsedPercent = if ($primary.Count) { $primary[0].usedPercent } else { $null }
+    secondaryUsedPercent = if ($secondary.Count) { $secondary[0].usedPercent } else { $null }
+    primaryResetAt = if ($primary.Count) { $primary[0].resetAt } else { $null }
+    secondaryResetAt = if ($secondary.Count) { $secondary[0].resetAt } else { $null }
+    mostUsedReasoningEffort = $Account.profileStats.mostUsedReasoningEffort
+    surface = "Local proxy"
+    model = "Unknown"
+  }
+
+  $samples = @($history.samples)
+  $last = if ($samples.Count -gt 0) { $samples[-1] } else { $null }
+  if ($null -eq $last -or $last.at -ne $sample.at) {
+    $samples += $sample
+  }
+
+  $sessions = Convert-SamplesToSessions $samples
+
+  $maxSamples = 2000
+  $maxSessions = 1000
+  $history.accountId = $Account.accountId
+  $history.email = $Account.email
+  $history.updatedAt = $sample.at
+  $history.samples = @($samples | Select-Object -Last $maxSamples)
+  $history.sessions = @($sessions | Select-Object -Last $maxSessions)
+  if ($null -ne $Analytics -and $null -eq (Get-PropertyValue $Analytics "error")) {
+    $history | Add-Member -MemberType NoteProperty -Name "analytics" -Value $Analytics -Force
+    $history | Add-Member -MemberType NoteProperty -Name "dailyUsageBuckets" -Value @($Analytics.rows) -Force
+    $history | Add-Member -MemberType NoteProperty -Name "modelBreakdown" -Value @($Analytics.modelBreakdown) -Force
+    $history | Add-Member -MemberType NoteProperty -Name "surfaceBreakdown" -Value @($Analytics.surfaceBreakdown) -Force
+  } else {
+    $existingAnalytics = Get-PropertyValue $history "analytics"
+    if ($null -ne $existingAnalytics) {
+      $history | Add-Member -MemberType NoteProperty -Name "analytics" -Value $existingAnalytics -Force
+      $history | Add-Member -MemberType NoteProperty -Name "dailyUsageBuckets" -Value @($existingAnalytics.rows) -Force
+      $history | Add-Member -MemberType NoteProperty -Name "modelBreakdown" -Value @($existingAnalytics.modelBreakdown) -Force
+      $history | Add-Member -MemberType NoteProperty -Name "surfaceBreakdown" -Value @($existingAnalytics.surfaceBreakdown) -Force
+    } else {
+      $history | Add-Member -MemberType NoteProperty -Name "dailyUsageBuckets" -Value $Account.profileStats.dailyUsageBuckets -Force
+      $history | Add-Member -MemberType NoteProperty -Name "modelBreakdown" -Value @() -Force
+      $history | Add-Member -MemberType NoteProperty -Name "surfaceBreakdown" -Value @([pscustomobject]@{ name = "Local proxy"; tokens = 0; turns = @($history.sessions).Count }) -Force
+    }
+  }
+
+  Write-JsonFile $history $historyPath
+  return $history
+}
+
 function Get-CachedDashboardSnapshot {
   New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
   $accounts = @()
@@ -396,6 +727,10 @@ function Get-CachedDashboardSnapshot {
       if (-not [string]::IsNullOrWhiteSpace([string](Get-PropertyValue $cached "accountId"))) {
         $cached | Add-Member -MemberType NoteProperty -Name "isLive" -Value $false -Force
         $cached | Add-Member -MemberType NoteProperty -Name "dataSource" -Value "cached snapshot from $($file.Name)" -Force
+        $historyPath = Get-HistoryPath $cached
+        if (Test-Path -LiteralPath $historyPath) {
+          $cached | Add-Member -MemberType NoteProperty -Name "history" -Value (ConvertFrom-JsonWithStringDates (Get-Content -LiteralPath $historyPath -Raw)) -Force
+        }
         $accounts += $cached
       }
     } catch {
@@ -466,12 +801,21 @@ $prefix = "http://127.0.0.1:$Port/"
 $listener.Prefixes.Add($prefix)
 $listener.Start()
 $script:Stopping = $false
-$cancelHandler = [ConsoleCancelEventHandler]{
-  param($Sender, $EventArgs)
-  $script:Stopping = $true
-  try { $listener.Stop() } catch {}
-  $EventArgs.Cancel = $false
+try {
+  Add-Type -TypeDefinition @"
+using System;
+
+public static class CodexResetsCtrlC
+{
+    public static void Handler(object sender, ConsoleCancelEventArgs e)
+    {
+        try { Console.WriteLine("Abort requested, exiting."); } catch {}
+        Environment.Exit(130);
+    }
 }
+"@
+} catch {}
+$cancelHandler = [ConsoleCancelEventHandler][CodexResetsCtrlC]::Handler
 [Console]::add_CancelKeyPress($cancelHandler)
 
 Write-Host "Codex Resets server running at $prefix"
@@ -500,6 +844,7 @@ try {
       }
 
       $path = $context.Request.Url.AbsolutePath
+      $pathAndQuery = $context.Request.Url.PathAndQuery
       if ($path -eq "/" -or $path -eq "/index.html") {
         $indexPath = Join-Path $Root "index.html"
         if (-not (Test-Path -LiteralPath $indexPath)) {
@@ -512,7 +857,7 @@ try {
       }
 
       if ($path -like "/backend-api/wham/*") {
-        Write-Response $context 200 "application/json; charset=utf-8" (Invoke-CodexProxy $path)
+        Write-Response $context 200 "application/json; charset=utf-8" (Invoke-CodexProxy $pathAndQuery)
         continue
       }
 
@@ -531,9 +876,12 @@ try {
     }
   }
 } finally {
-  [Console]::remove_CancelKeyPress($cancelHandler)
+  try { [Console]::remove_CancelKeyPress($cancelHandler) } catch {}
   if ($listener.IsListening) {
     $listener.Stop()
   }
   $listener.Close()
+  if ($script:Stopping) {
+    Write-Host "Codex Resets server stopped."
+  }
 }

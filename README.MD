@@ -11,6 +11,9 @@ A self-contained local dashboard for checking Codex reset credits, current usage
 - Shows each reset credit with status, `granted_at`, and `expires_at` in `YYYY-MM-DD • HH:MM:SS` local-time format.
 - Displays current 5-hour and 7-day Codex usage windows with remaining percentage and reset time.
 - Displays profile-card stats similar to the Codex UI, including lifetime tokens, peak tokens, longest task, current streak, and longest streak.
+- Tracks account history in a dedicated History card with month-selectable full-calendar daily usage bars, model and surface charts, dated per-model usage entries, estimated API dollar cost, and inferred working-session rows from successful polls.
+- Uses absolute chart axes: Personal Usage has left-side token gridlines every 5M tokens, while Model and Surface charts have left-side turn gridlines every 5 turns.
+- Shows current 5-hour and 7-day usage in the Status card with the original remaining-usage bar, plus red consumed-percentage labels next to the remaining percentage.
 - Polls the currently active `~/.codex/auth.json` account live, then caches the latest successful snapshot per account.
 - Generates an `index.html` page that refreshes the active account every 30 seconds through a local `127.0.0.1` proxy and falls back to cached data if live fetches fail.
 - Does not embed OAuth access or refresh tokens in `index.html`.
@@ -21,6 +24,7 @@ A self-contained local dashboard for checking Codex reset credits, current usage
 - `Start-CodexResetsServer.ps1`: Starts the local browser/proxy server used for live refreshes.
 - `index.html`: The generated self-contained dashboard.
 - `.codex-cache/`: Local cached account snapshots from successful live polls. This directory is ignored by git.
+- `.codex-cache/history/`: Local per-account history files with successful polling samples, inferred sessions, and analytics usage rows. This directory is ignored by git.
 - `dashboard-screenshot.png`: Redacted screenshot for documentation.
 - `.gitignore`: Prevents saved auth bundles from being committed.
 
@@ -39,8 +43,17 @@ The script and browser page query:
 - `GET https://chatgpt.com/backend-api/wham/usage`
 - `GET https://chatgpt.com/backend-api/wham/profiles/me`
 - `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`
+- `GET https://chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&group_by=day`
 
 The requests send the same auth pattern Codex uses: `Authorization: Bearer ...`, `ChatGPT-Account-ID`, `OpenAI-Beta: codex-1`, and `originator: Codex Desktop`.
+
+The analytics endpoint returns the daily source data used for Codex usage charts, including totals, clients/surfaces, and models. The local server stores that data in `.codex-cache/history/` when a live refresh succeeds. If the analytics endpoint fails, the page keeps the last successful analytics cache and still records polling samples from the other endpoints.
+
+History charts render every day in the selected month, including empty days, and are constrained to the panel width at narrow desktop sizes. If the daily analytics endpoint has not published today's bucket yet, the page appends a live-sample row aggregated from all polling samples recorded today. When token deltas are unavailable but usage-window movement proves activity happened, the current-day token bar is marked as an estimate based on recent average tokens per turn.
+
+Working sessions are inferred from polling samples. A session stays open across short polling gaps and only closes after at least five minutes without additional usage movement, or when usage counters reset/decrease. Session rows include duration, 5-hour and 7-day percentage movement, reset-credit movement, sample count, reasoning, model mix, and surface. When exact per-session token/thread counts are not returned by the polling endpoint, the dashboard allocates the day's analytics totals across sessions by usage-window movement and marks estimated values with `≈`. Model mix is only shown when that day's analytics row includes model data; otherwise current-day live samples show `N/A` rather than guessing from prior days.
+
+Daily Entries use the original per-model row layout. The analytics endpoint currently returns daily token totals plus per-model turn counts, but not per-model token totals, so per-model token/cost/input/cache/output values are turn-share estimates only when the allocation is not ambiguous. If multiple reported model rows have identical model-only metrics or identical same-day allocation shares, their allocated token/cost fields are left blank instead of fabricating duplicate-looking values.
 
 ## Usage
 
@@ -62,7 +75,7 @@ Start the local proxy server first:
 .\Start-CodexResetsServer.ps1
 ```
 
-The generated page refreshes the active account every 30 seconds while it is open. Rerun the update script after switching Codex accounts so that account becomes the live account in the page and its cached snapshot gets updated.
+The generated page refreshes the active account every 30 seconds while it is open. After switching Codex accounts, refresh the page or let the next 30-second poll run; the local server will detect the active account, update or create that account's tab, and save its latest snapshot/history.
 
 ## Adding Accounts
 

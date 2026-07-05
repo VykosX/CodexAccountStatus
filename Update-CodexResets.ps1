@@ -143,6 +143,35 @@ function New-SafeFileStem {
   return $safe
 }
 
+function Get-HistoryPath {
+  param([Parameter(Mandatory = $true)]$Account)
+
+  $historyDir = Join-Path $CacheDir "history"
+  $identity = First-NonEmpty (Get-PropertyValue $Account "email") (Get-PropertyValue $Account "name") (Get-PropertyValue $Account "accountId")
+  $accountId = [string](Get-PropertyValue $Account "accountId")
+  if ([string]::IsNullOrWhiteSpace($accountId)) {
+    return $null
+  }
+
+  $shortId = $accountId.Substring(0, [Math]::Min(8, $accountId.Length))
+  return Join-Path $historyDir ("$(New-SafeFileStem "$identity-$shortId").history.json")
+}
+
+function Add-HistoryIfPresent {
+  param([Parameter(Mandatory = $true)]$Account)
+
+  $historyPath = Get-HistoryPath $Account
+  if ($null -eq $historyPath -or -not (Test-Path -LiteralPath $historyPath)) {
+    return
+  }
+
+  try {
+    $Account | Add-Member -MemberType NoteProperty -Name "history" -Value (Read-JsonFile $historyPath) -Force
+  } catch {
+    Write-Warning "Skipping history $historyPath`: $($_.Exception.Message)"
+  }
+}
+
 function Get-AuthAccountInfo {
   param(
     [Parameter(Mandatory = $true)]$Auth,
@@ -399,6 +428,7 @@ function Get-ProfileStats {
   $profile = Get-PropertyValue $json "profile"
   $stats = Get-PropertyValue $json "stats"
   $metadata = Get-PropertyValue $json "metadata"
+  $dailyUsageBuckets = @(Get-PropertyValue $stats "daily_usage_buckets")
 
   return [pscustomobject]@{
     username = Get-PropertyValue $profile "username"
@@ -414,6 +444,12 @@ function Get-ProfileStats {
     fastModeUsagePercentage = Get-PropertyValue $stats "fast_mode_usage_percentage"
     mostUsedReasoningEffort = Get-PropertyValue $stats "most_used_reasoning_effort"
     mostUsedReasoningEffortPercentage = Get-PropertyValue $stats "most_used_reasoning_effort_percentage"
+    dailyUsageBuckets = @($dailyUsageBuckets | ForEach-Object {
+      [pscustomobject]@{
+        date = Get-PropertyValue $_ "start_date"
+        tokens = Get-PropertyValue $_ "tokens"
+      }
+    })
   }
 }
 
@@ -846,6 +882,10 @@ function Write-ResetHtml {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
     }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replace(/`/g, "&#096;");
+    }
   </script>
 </body>
 </html>
@@ -903,7 +943,7 @@ function Write-CodexDashboardHtml {
     }
 
     main {
-      width: min(1120px, calc(100% - 32px));
+      width: min(1440px, calc(100% - 32px));
       margin: 0 auto;
       padding: 34px 0 42px;
     }
@@ -1144,7 +1184,7 @@ function Write-CodexDashboardHtml {
 
     .limit-row {
       display: grid;
-      grid-template-columns: 72px minmax(0, 1fr) auto;
+      grid-template-columns: 72px minmax(0, 1fr) minmax(180px, auto);
       gap: 12px;
       align-items: center;
       margin-top: 12px;
@@ -1173,6 +1213,11 @@ function Write-CodexDashboardHtml {
       color: var(--text);
       font-size: 12px;
       white-space: nowrap;
+    }
+
+    .limit-value .used {
+      color: #ff7777;
+      margin-right: 8px;
     }
 
     .limit-value span {
@@ -1247,6 +1292,284 @@ function Write-CodexDashboardHtml {
       color: var(--dim);
       font-size: 12px;
       margin-top: 10px;
+    }
+
+    .history-grid {
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .history-grid > div {
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .history-summary {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .mini-metric {
+      align-items: center;
+      background: #151716;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-height: 82px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+
+    .mini-metric span {
+      color: var(--muted);
+      display: block;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .mini-metric strong {
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+    }
+
+    .mini-metric strong.long-value {
+      font-size: 15px;
+    }
+
+    .bar-chart {
+      align-items: end;
+      box-sizing: border-box;
+      display: grid;
+      gap: 6px;
+      min-height: 224px;
+      max-width: 100%;
+      overflow: hidden;
+      padding: 0;
+      width: 100%;
+    }
+
+    .metric-chart {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 56px minmax(0, 1fr);
+      max-width: 100%;
+      min-width: 0;
+    }
+
+    .metric-axis,
+    .metric-plot {
+      height: 242px;
+      position: relative;
+    }
+
+    .metric-axis {
+      border-right: 1px solid var(--line);
+    }
+
+    .axis-label {
+      color: var(--dim);
+      font-size: 10px;
+      line-height: 1;
+      position: absolute;
+      right: 8px;
+      transform: translateY(50%);
+      white-space: nowrap;
+    }
+
+    .metric-plot {
+      border-bottom: 1px solid var(--line);
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .metric-gridline {
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      left: 0;
+      position: absolute;
+      right: 0;
+    }
+
+    .metric-plot .bar-chart,
+    .metric-plot .area-chart {
+      height: 242px;
+      left: 0;
+      position: absolute;
+      right: 0;
+      top: 0;
+      z-index: 1;
+    }
+
+    .chart-header {
+      align-items: center;
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .chart-header h4 {
+      margin: 0;
+    }
+
+    .chart-select {
+      background: #151716;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--text);
+      font: inherit;
+      padding: 7px 10px;
+    }
+
+    .chart-box {
+      display: grid;
+      gap: 8px;
+      max-width: 100%;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .bar-column {
+      align-items: stretch;
+      display: grid;
+      gap: 6px;
+      grid-template-rows: 200px auto;
+      min-width: 0;
+    }
+
+    .bar-stack {
+      align-items: end;
+      display: flex;
+      height: 200px;
+      justify-content: center;
+      min-width: 0;
+    }
+
+    .bar {
+      background: #e52727;
+      border-radius: 5px 5px 0 0;
+      min-height: 2px;
+      position: relative;
+      width: 100%;
+    }
+
+    .bar-label {
+      color: var(--dim);
+      font-size: 10px;
+      line-height: 1.1;
+      min-height: 22px;
+      text-align: center;
+    }
+
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin-top: 4px;
+    }
+
+    .legend-item {
+      align-items: center;
+      color: var(--muted);
+      display: inline-flex;
+      font-size: 12px;
+      gap: 6px;
+    }
+
+    .legend-swatch {
+      border-radius: 999px;
+      display: inline-block;
+      height: 9px;
+      width: 9px;
+    }
+
+    .area-chart {
+      border-bottom: 1px solid var(--line);
+      box-sizing: border-box;
+      display: grid;
+      gap: 6px;
+      max-width: 100%;
+      min-height: 180px;
+      overflow: hidden;
+      padding-top: 14px;
+      width: 100%;
+    }
+
+    .area-column {
+      align-items: end;
+      display: grid;
+      gap: 5px;
+      grid-template-rows: 200px auto;
+      min-width: 0;
+    }
+
+    .area-stack {
+      align-items: end;
+      display: flex;
+      flex-direction: column;
+      height: 200px;
+      justify-content: flex-end;
+      overflow: hidden;
+      width: 100%;
+    }
+
+    .area-segment {
+      border-radius: 4px 4px 0 0;
+      min-height: 1px;
+      width: 100%;
+    }
+
+    .bar:hover::after {
+      display: none;
+    }
+
+    .history-bars {
+      display: grid;
+      gap: 10px;
+    }
+
+    .table-scroll {
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .session-table {
+      table-layout: auto;
+      width: 100%;
+      min-width: 100%;
+    }
+
+    .session-table th,
+    .session-table td {
+      white-space: nowrap;
+    }
+
+    .history-row {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 110px 1fr 90px;
+      align-items: center;
+    }
+
+    .breakdown {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      background: #202320;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--text);
+      font-size: 12px;
+      padding: 6px 10px;
     }
 
     .note,
@@ -1387,6 +1710,7 @@ function Write-CodexDashboardHtml {
     const liveAuth = JSON.parse(document.getElementById("live-auth").textContent);
     const accounts = Array.isArray(resetData.accounts) ? resetData.accounts : [];
     const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || resetData.timeZone || "local";
+    const historyMonths = {};
     let activeIndex = 0;
 
     updateChromeText();
@@ -1643,6 +1967,13 @@ function Write-CodexDashboardHtml {
           <h3>Reset Credits</h3>
           ${renderCredits(account)}
         </article>
+
+        <article class="panel" style="margin-top:16px">
+          <h3>History</h3>
+          <div class="panel-body">
+            ${renderHistory(account)}
+          </div>
+        </article>
       `;
     }
 
@@ -1665,13 +1996,14 @@ function Write-CodexDashboardHtml {
 
       const rows = windows.map((window) => {
         const remaining = clampPercent(window.remainingPercent);
+        const used = clampPercent(window.usedPercent);
         return `
           <div class="limit-row">
             <div class="limit-label">${escapeHtml(window.label || window.kind || "limit")} limit:</div>
             <div class="track" aria-label="${escapeHtml(window.label || "limit")} remaining">
               <div class="fill" style="width:${remaining}%"></div>
             </div>
-            <div class="limit-value">${remaining}% left <span>(resets ${escapeHtml(window.resetAt || "")})</span></div>
+            <div class="limit-value">${remaining}% left <span class="separator">•</span> <span class="used">${used}% used</span> <span>(resets ${escapeHtml(window.resetAt || "")})</span></div>
           </div>
         `;
       }).join("");
@@ -1764,6 +2096,619 @@ function Write-CodexDashboardHtml {
       `;
     }
 
+    function renderHistory(account) {
+      const history = account.history || {};
+      const sessions = Array.isArray(history.sessions) ? history.sessions : [];
+      const samples = Array.isArray(history.samples) ? history.samples : [];
+      const rawDailyBuckets = Array.isArray(history.dailyUsageBuckets) && history.dailyUsageBuckets.length
+        ? history.dailyUsageBuckets
+        : (Array.isArray(account.profileStats?.dailyUsageBuckets) ? account.profileStats.dailyUsageBuckets : []);
+      const dailyBuckets = withLiveTodayBucket(rawDailyBuckets, samples);
+      const totalTokens = sessions.reduce((sum, session) => sum + Number(session.tokensUsed || 0), 0);
+      const totalThreads = sessions.reduce((sum, session) => sum + Number(session.threadDelta || 0), 0);
+      const analytics = history.analytics || {};
+      const totals = analytics.totals || {};
+      const latest = samples[samples.length - 1] || {};
+
+      return `
+        <div class="history-grid">
+          <div class="history-summary">
+            ${miniMetric("Samples", integer(samples.length))}
+            ${miniMetric("Sessions", integer(sessions.length))}
+            ${miniMetric("30d tokens", compactNumber(totals.textTotalTokens ?? totalTokens))}
+            ${miniMetric("30d turns", integer(totals.turns ?? totalThreads))}
+            ${miniMetric("30d credits", number(totals.credits, 2))}
+            ${miniMetric("Analytics as of", analytics.fetchedAt || "--")}
+          </div>
+          <div>
+            <div class="chart-header">
+              <h4>Personal Usage (tokens/day)</h4>
+              ${renderMonthSelect(account, dailyBuckets)}
+            </div>
+            ${renderDailyBars(account, dailyBuckets)}
+          </div>
+          <div>
+            <h4>Usage by Model (turns)</h4>
+            ${renderStackedUsageChart(account, dailyBuckets, "model")}
+          </div>
+          <div>
+            <h4>Usage by Surface (turns)</h4>
+            ${renderStackedUsageChart(account, dailyBuckets, "surface")}
+          </div>
+          <div>
+            <h4>Working Sessions</h4>
+            ${renderSessionTable(sessions, latest, dailyBuckets)}
+          </div>
+          <div>
+            <h4>Daily Entries</h4>
+            ${renderDailyTable(dailyBuckets)}
+          </div>
+        </div>
+      `;
+    }
+
+    function miniMetric(label, value) {
+      const text = String(value ?? "--");
+      const longClass = text.length > 14 ? " long-value" : "";
+      return `<div class="mini-metric"><span>${escapeHtml(label)}</span><strong class="${longClass.trim()}">${escapeHtml(text)}</strong></div>`;
+    }
+
+    function renderMonthSelect(account, buckets) {
+      const months = availableMonths(buckets);
+      if (months.length <= 1) return "";
+      const selected = selectedHistoryMonth(account, buckets);
+      return `
+        <select class="chart-select" aria-label="Usage month" onchange="setHistoryMonth('${escapeAttr(account.accountId || "")}', this.value)">
+          ${months.map((month) => `<option value="${escapeAttr(month)}"${month === selected ? " selected" : ""}>${escapeHtml(monthLabel(month))}</option>`).join("")}
+        </select>
+      `;
+    }
+
+    window.setHistoryMonth = function(accountId, month) {
+      historyMonths[accountId || "active"] = month;
+      renderAccount();
+    };
+
+    function selectedHistoryMonth(account, buckets) {
+      const months = availableMonths(buckets);
+      if (!months.length) return "";
+      const key = account.accountId || "active";
+      if (historyMonths[key] && months.includes(historyMonths[key])) return historyMonths[key];
+      historyMonths[key] = months[months.length - 1];
+      return historyMonths[key];
+    }
+
+    function availableMonths(buckets) {
+      return [...new Set((Array.isArray(buckets) ? buckets : [])
+        .map((bucket) => String(bucket.date || "").slice(0, 7))
+        .filter(Boolean))]
+        .sort();
+    }
+
+    function monthBuckets(account, buckets) {
+      const selected = selectedHistoryMonth(account, buckets);
+      return expandMonthBuckets(selected, buckets);
+    }
+
+    function monthLabel(month) {
+      const [year, monthNumber] = String(month).split("-").map(Number);
+      if (!year || !monthNumber) return month;
+      return new Date(year, monthNumber - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+    }
+
+    function expandMonthBuckets(month, buckets) {
+      const [year, monthNumber] = String(month || "").split("-").map(Number);
+      if (!year || !monthNumber) return [];
+      const daysInMonth = new Date(year, monthNumber, 0).getDate();
+      const byDate = new Map((Array.isArray(buckets) ? buckets : [])
+        .filter((bucket) => String(bucket.date || "").startsWith(month))
+        .map((bucket) => [bucket.date, bucket]));
+      return Array.from({ length: daysInMonth }, (_, index) => {
+        const date = `${year}-${String(monthNumber).padStart(2, "0")}-${String(index + 1).padStart(2, "0")}`;
+        return byDate.get(date) || {
+          date,
+          users: 0,
+          threads: 0,
+          turns: 0,
+          credits: 0,
+          uncachedTextInputTokens: 0,
+          cachedTextInputTokens: 0,
+          textOutputTokens: 0,
+          tokens: 0,
+          clients: [],
+          models: [],
+          empty: true
+        };
+      });
+    }
+
+    function withLiveTodayBucket(buckets, samples) {
+      const rows = Array.isArray(buckets) ? buckets.map((bucket) => ({ ...bucket })) : [];
+      const latest = Array.isArray(samples) && samples.length ? samples[samples.length - 1] : null;
+      if (!latest?.at) return rows;
+
+      const today = String(latest.at).slice(0, 10);
+      if (!today || rows.some((bucket) => bucket.date === today)) return rows;
+
+      const todaySamples = (Array.isArray(samples) ? samples : []).filter((sample) => String(sample.at || "").startsWith(today));
+      const first = todaySamples[0] || latest;
+      const last = todaySamples[todaySamples.length - 1] || latest;
+      const tokenDelta = Math.max(0, Number(last.lifetimeTokens || 0) - Number(first.lifetimeTokens || 0));
+      const threadDelta = Math.max(0, Number(last.totalThreads || 0) - Number(first.totalThreads || 0));
+      const primaryDelta = Math.max(0, Number(last.primaryUsedPercent || 0) - Number(first.primaryUsedPercent || 0));
+      const secondaryDelta = Math.max(0, Number(last.secondaryUsedPercent || 0) - Number(first.secondaryUsedPercent || 0));
+      const hasLiveActivity = tokenDelta > 0 || threadDelta > 0 || primaryDelta > 0 || secondaryDelta > 0;
+      const inferredTurns = hasLiveActivity ? Math.max(1, threadDelta, Math.ceil(primaryDelta + secondaryDelta)) : 0;
+      const averageTokensPerTurn = averageMetricPerTurn(rows, "tokens");
+      const displayTokens = tokenDelta > 0 ? tokenDelta : (hasLiveActivity ? averageTokensPerTurn * inferredTurns : 0);
+      rows.push({
+        date: today,
+        users: hasLiveActivity ? 1 : 0,
+        threads: threadDelta,
+        turns: inferredTurns,
+        credits: 0,
+        uncachedTextInputTokens: displayTokens,
+        cachedTextInputTokens: 0,
+        textOutputTokens: 0,
+        tokens: displayTokens,
+        clients: hasLiveActivity ? [{ client_id: "LOCAL_LIVE_SAMPLE", turns: inferredTurns, threads: threadDelta, text_total_tokens: displayTokens }] : [],
+        models: hasLiveActivity ? [{ model: "N/A", turns: inferredTurns, threads: threadDelta, pending: true }] : [],
+        estimated: true
+      });
+      return rows.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    }
+
+    function averageMetricPerTurn(rows, metric) {
+      const totals = (Array.isArray(rows) ? rows : []).reduce((acc, row) => {
+        acc.value += Number(row[metric] || 0);
+        acc.turns += Number(row.turns || 0);
+        return acc;
+      }, { value: 0, turns: 0 });
+      return totals.turns > 0 ? totals.value / totals.turns : 0;
+    }
+
+    function niceAxis(maxValue, targetTicks = 7) {
+      const max = Math.max(1, Number(maxValue || 0));
+      const rawStep = max / Math.max(1, targetTicks - 1);
+      const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const normalized = rawStep / magnitude;
+      const niceNormalized = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10;
+      const step = niceNormalized * magnitude;
+      const axisMax = Math.ceil(max / step) * step;
+      const tickCount = Math.floor(axisMax / step);
+      return {
+        step,
+        max: axisMax,
+        ticks: Array.from({ length: tickCount + 1 }, (_, index) => index * step)
+      };
+    }
+
+    function renderDailyBars(account, buckets) {
+      const recent = monthBuckets(account, buckets);
+      if (!recent.length) return `<p class="note">No daily usage buckets have been recorded for this month.</p>`;
+      const maxTokens = Math.max(...recent.map((bucket) => Number(bucket.tokens || 0)), 1);
+      const axis = niceAxis(maxTokens, 7);
+      const axisMax = axis.max;
+      const ticks = axis.ticks;
+      const plotHeight = 200;
+      const labelSpace = 24;
+      return `<div class="chart-box">
+        <div class="metric-chart">
+          <div class="metric-axis" aria-hidden="true">
+            ${ticks.map((tick) => `<span class="axis-label" style="bottom:${labelSpace + ((tick / axisMax) * plotHeight)}px">${escapeHtml(compactNumber(tick))}</span>`).join("")}
+          </div>
+          <div class="metric-plot">
+            ${ticks.map((tick) => `<span class="metric-gridline" style="bottom:${labelSpace + ((tick / axisMax) * plotHeight)}px"></span>`).join("")}
+            <div class="bar-chart" style="grid-template-columns: repeat(${recent.length}, minmax(0, 1fr))">${recent.map((bucket) => {
+        const tokens = Number(bucket.tokens || 0);
+        const height = tokens > 0 ? Math.max(2, (tokens / axisMax) * 100) : 0;
+        return `
+          <div class="bar-column">
+            <div class="bar-stack">${height > 0 ? `<div class="bar" style="height:${height}%" title="${escapeAttr(`${bucket.date || ""}: ${compactNumber(tokens)} tokens`)}"></div>` : ""}</div>
+            <div class="bar-label">${escapeHtml(dayLabel(bucket.date))}</div>
+          </div>
+        `;
+      }).join("")}</div>
+          </div>
+        </div>
+        <div class="chart-legend"><span class="legend-item"><span class="legend-swatch" style="background:#e52727"></span>Daily tokens</span></div>
+      </div>`;
+    }
+
+    function renderStackedUsageChart(account, buckets, kind) {
+      const rows = monthBuckets(account, buckets);
+      const sourceRows = rows.filter((row) => !row.empty);
+      const seriesNames = usageSeriesNames(sourceRows, kind);
+      if (!rows.length || !seriesNames.length) return `<p class="note">No ${escapeHtml(kind)} usage breakdown is available for this month.</p>`;
+      const colors = chartColors(seriesNames.length);
+      const maxTurns = Math.max(...rows.map((bucket) => Number(bucket.turns || 0)), 1);
+      const axis = niceAxis(maxTurns, 7);
+      const axisMax = axis.max;
+      const ticks = axis.ticks;
+      const plotHeight = 200;
+      const labelSpace = 24;
+      return `
+        <div class="chart-box">
+          <div class="metric-chart">
+            <div class="metric-axis" aria-hidden="true">
+              ${ticks.map((tick) => `<span class="axis-label" style="bottom:${labelSpace + ((tick / axisMax) * plotHeight)}px">${escapeHtml(integer(tick))}</span>`).join("")}
+            </div>
+            <div class="metric-plot">
+              ${ticks.map((tick) => `<span class="metric-gridline" style="bottom:${labelSpace + ((tick / axisMax) * plotHeight)}px"></span>`).join("")}
+              <div class="area-chart" style="grid-template-columns: repeat(${rows.length}, minmax(0, 1fr))">
+                ${rows.map((bucket) => {
+              const values = usageSeriesValues(bucket, kind, seriesNames);
+              return `
+                <div class="area-column">
+                  <div class="area-stack" data-title="${escapeAttr(`${bucket.date}: ${integer(bucket.turns || 0)} turns`)}">
+                    ${seriesNames.map((name, index) => {
+                      const height = Math.max(0, (Number(values[name] || 0) / axisMax) * 100);
+                      return height > 0 ? `<div class="area-segment" style="height:${height}%; background:${colors[index]}" title="${escapeAttr(`${name}: ${integer(values[name])} turns`)}"></div>` : "";
+                    }).join("")}
+                  </div>
+                  <div class="bar-label">${escapeHtml(dayLabel(bucket.date))}</div>
+                </div>
+              `;
+                }).join("")}
+              </div>
+            </div>
+          </div>
+          <div class="chart-legend">
+            ${seriesNames.map((name, index) => `<span class="legend-item"><span class="legend-swatch" style="background:${colors[index]}"></span>${escapeHtml(surfaceLabel(name))}</span>`).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderSessionTable(sessions, latest, buckets) {
+      const sessionEstimates = estimateSessionMetrics(sessions, buckets);
+      const rows = sessions.slice(-12).reverse();
+      if (!rows.length) {
+        const sampleText = latest?.at ? ` Latest sample: ${escapeHtml(latest.at)}.` : "";
+        return `<p class="note">No changing usage intervals have been recorded yet.${sampleText}</p>`;
+      }
+
+      return `
+        <div class="table-scroll">
+        <table class="session-table">
+          <thead>
+            <tr>
+              <th>Session</th>
+              <th>Duration</th>
+              <th>Tokens</th>
+              <th>Threads / turns</th>
+              <th>5h</th>
+              <th>7d</th>
+              <th>Credits</th>
+              <th>Samples</th>
+              <th>Reasoning</th>
+              <th>Model</th>
+              <th>Surface</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((session) => `
+              <tr>
+                <td data-label="Session" class="stamp">${escapeHtml(sessionRange(session.base || session))}</td>
+                <td data-label="Duration">${escapeHtml(sessionDuration(session.base || session))}</td>
+                <td data-label="Tokens">${escapeHtml(sessionTokens(session, sessionEstimates))}</td>
+                <td data-label="Threads / turns">${escapeHtml(sessionThreads(session, sessionEstimates))}</td>
+                <td data-label="5h">${escapeHtml(percentDelta(session.primaryUsedPercentStart, session.primaryUsedPercentEnd))}</td>
+                <td data-label="7d">${escapeHtml(percentDelta(session.secondaryUsedPercentStart, session.secondaryUsedPercentEnd))}</td>
+                <td data-label="Credits">${escapeHtml(sessionCreditDelta(session))}</td>
+                <td data-label="Samples">${escapeHtml(integer(session.sampleCount || 0))}</td>
+                <td data-label="Reasoning">${escapeHtml(session.reasoning || "--")}</td>
+                <td data-label="Model">${escapeHtml(sessionModelSummary(session, sessionEstimates))}</td>
+                <td data-label="Surface">${escapeHtml(session.surface || "Unknown")}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+        </div>
+      `;
+    }
+
+    function renderDailyTable(buckets) {
+      const rows = dailyModelRows(buckets).slice(-80).reverse();
+      if (!rows.length) return `<p class="note">No dated usage entries are available yet.</p>`;
+      return `
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Model</th>
+              <th>Tokens</th>
+              <th>Est. API $</th>
+              <th>Credits</th>
+              <th>Turns</th>
+              <th>Threads</th>
+              <th>Input</th>
+              <th>Cached</th>
+              <th>Output</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((bucket) => `
+              <tr>
+                <td data-label="Date" class="stamp">${escapeHtml(bucket.date || "")}</td>
+                <td data-label="Model">${escapeHtml(bucket.model || "Unknown")}</td>
+                <td data-label="Tokens">${escapeHtml(bucket.tokens == null ? "--" : compactNumber(bucket.tokens))}</td>
+                <td data-label="Est. API $">${escapeHtml(bucket.estimatedApiUsd == null ? "--" : formatUsd(bucket.estimatedApiUsd))}</td>
+                <td data-label="Credits">${escapeHtml(bucket.credits == null ? "--" : number(bucket.credits, 2))}</td>
+                <td data-label="Turns">${escapeHtml(integer(bucket.turns || 0))}</td>
+                <td data-label="Threads">${escapeHtml(integer(bucket.threads || 0))}</td>
+                <td data-label="Input">${escapeHtml(bucket.uncachedTextInputTokens == null ? "--" : compactNumber(bucket.uncachedTextInputTokens))}</td>
+                <td data-label="Cached">${escapeHtml(bucket.cachedTextInputTokens == null ? "--" : compactNumber(bucket.cachedTextInputTokens))}</td>
+                <td data-label="Output">${escapeHtml(bucket.textOutputTokens == null ? "--" : compactNumber(bucket.textOutputTokens))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function dayLabel(dateText) {
+      const text = String(dateText || "");
+      const day = text.slice(8, 10);
+      return day || text;
+    }
+
+    function usageSeriesNames(rows, kind) {
+      const names = new Set();
+      for (const row of rows) {
+        if (kind === "model") {
+          for (const model of Array.isArray(row.models) ? row.models : []) {
+            names.add(model.model || model.name || "Unknown");
+          }
+        } else {
+          for (const client of Array.isArray(row.clients) ? row.clients : []) {
+            names.add(client.client_id || client.name || "Unknown");
+          }
+        }
+      }
+      return [...names].sort();
+    }
+
+    function usageSeriesValues(row, kind, names) {
+      const values = Object.fromEntries(names.map((name) => [name, 0]));
+      if (kind === "model") {
+        for (const model of Array.isArray(row.models) ? row.models : []) {
+          const name = model.model || model.name || "Unknown";
+          values[name] = (values[name] || 0) + Number(model.turns || 0);
+        }
+      } else {
+        for (const client of Array.isArray(row.clients) ? row.clients : []) {
+          const name = client.client_id || client.name || "Unknown";
+          values[name] = (values[name] || 0) + Number(client.turns || 0);
+        }
+      }
+      return values;
+    }
+
+    function dailyModelRows(buckets) {
+      const rows = [];
+      for (const bucket of Array.isArray(buckets) ? buckets : []) {
+        const models = Array.isArray(bucket.models) && bucket.models.length ? bucket.models : [{ model: "Unknown", turns: bucket.turns || 0, threads: bucket.threads || 0 }];
+        const totalTurns = models.reduce((sum, model) => sum + Number(model.turns || 0), 0) || 1;
+        const duplicateShapes = duplicateModelShapes(models);
+        const duplicateShares = duplicateModelShares(models);
+        for (const model of models) {
+          const shape = modelShape(model);
+          const shareKey = modelShareShape(model);
+          const duplicateShaped = duplicateShapes.has(shape) || duplicateShares.has(shareKey);
+          const share = Number(model.turns || 0) / totalTurns;
+          const allocated = !duplicateShaped;
+          rows.push({
+            date: bucket.date,
+            model: model.model || model.name || "Unknown",
+            tokens: allocated ? Number(bucket.tokens || 0) * share : null,
+            credits: allocated ? Number(bucket.credits || 0) * share : Number(model.credits || 0),
+            turns: Number(model.turns || 0),
+            threads: Number(model.threads ?? bucket.threads ?? 0),
+            uncachedTextInputTokens: allocated ? Number(bucket.uncachedTextInputTokens || 0) * share : null,
+            cachedTextInputTokens: allocated ? Number(bucket.cachedTextInputTokens || 0) * share : null,
+            textOutputTokens: allocated ? Number(bucket.textOutputTokens || 0) * share : null,
+            estimatedApiUsd: null
+          });
+          rows[rows.length - 1].estimatedApiUsd = allocated
+            ? estimateApiUsd(rows[rows.length - 1].model, rows[rows.length - 1].uncachedTextInputTokens, rows[rows.length - 1].cachedTextInputTokens, rows[rows.length - 1].textOutputTokens)
+            : null;
+        }
+      }
+      return rows;
+    }
+
+    function modelShape(model) {
+      return [
+        Number(model.turns || 0),
+        Number(model.threads || 0),
+        Number(model.users || 0),
+        Number(model.credits || 0)
+      ].join("|");
+    }
+
+    function duplicateModelShapes(models) {
+      const counts = new Map();
+      for (const model of Array.isArray(models) ? models : []) {
+        const shape = modelShape(model);
+        counts.set(shape, (counts.get(shape) || 0) + 1);
+      }
+      return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([shape]) => shape));
+    }
+
+    function modelShareShape(model) {
+      return String(Number(model.turns || 0));
+    }
+
+    function duplicateModelShares(models) {
+      const counts = new Map();
+      for (const model of Array.isArray(models) ? models : []) {
+        const shape = modelShareShape(model);
+        counts.set(shape, (counts.get(shape) || 0) + 1);
+      }
+      return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([shape]) => shape));
+    }
+
+    function estimateApiUsd(model, uncachedInput, cachedInput, output) {
+      const rates = apiRates(model);
+      return ((Number(uncachedInput || 0) / 1_000_000) * rates.input) +
+        ((Number(cachedInput || 0) / 1_000_000) * rates.cachedInput) +
+        ((Number(output || 0) / 1_000_000) * rates.output);
+    }
+
+    function apiRates(model) {
+      const key = String(model || "").toLowerCase();
+      if (key.includes("5.5")) return { input: 5.00, cachedInput: 0.50, output: 30.00 };
+      if (key.includes("5.4-mini")) return { input: 0.75, cachedInput: 0.075, output: 4.50 };
+      if (key.includes("5.4")) return { input: 2.50, cachedInput: 0.25, output: 15.00 };
+      return { input: 5.00, cachedInput: 0.50, output: 30.00 };
+    }
+
+    function chartColors(count) {
+      const palette = ["#3b82f6", "#1d4ed8", "#c4b5fd", "#8b5cf6", "#f97316", "#14b8a6", "#facc15", "#fb7185"];
+      return Array.from({ length: count }, (_, index) => palette[index % palette.length]);
+    }
+
+    function surfaceLabel(value) {
+      return String(value || "Unknown")
+        .replace(/^CODEX_/i, "")
+        .replace(/_/g, " ")
+        .toLowerCase()
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
+    }
+
+    function formatUsd(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: n >= 10 ? 2 : 4 });
+    }
+
+    function percentDelta(start, end) {
+      if (start == null || end == null) return "--";
+      const delta = Number(end) - Number(start);
+      const sign = delta > 0 ? "+" : "";
+      return `${Number(start).toFixed(0)}% → ${Number(end).toFixed(0)}% (${sign}${delta.toFixed(0)})`;
+    }
+
+    function sessionRange(session) {
+      const start = String(session.start || "");
+      const end = String(session.end || "");
+      if (!start && !end) return "--";
+      const endTime = end.includes(" • ") ? end.split(" • ").pop() : end;
+      return `${start || "--"} → ${endTime || "--"}`;
+    }
+
+    function sessionDuration(session) {
+      const start = parseLocalStamp(session.start);
+      const end = parseLocalStamp(session.end);
+      if (!start || !end) return "--";
+      return duration(Math.max(0, Math.round((end - start) / 1000)));
+    }
+
+    function sessionUsageMoved(session) {
+      return Math.abs(Number(session.primaryUsedPercentEnd || 0) - Number(session.primaryUsedPercentStart || 0)) > 0 ||
+        Math.abs(Number(session.secondaryUsedPercentEnd || 0) - Number(session.secondaryUsedPercentStart || 0)) > 0;
+    }
+
+    function sessionMovement(session) {
+      return Math.max(0,
+        Math.abs(Number(session.primaryUsedPercentEnd || 0) - Number(session.primaryUsedPercentStart || 0)) +
+        Math.abs(Number(session.secondaryUsedPercentEnd || 0) - Number(session.secondaryUsedPercentStart || 0))
+      );
+    }
+
+    function sessionDate(session) {
+      return String(session.start || session.end || "").slice(0, 10);
+    }
+
+    function estimateSessionMetrics(sessions, buckets) {
+      const bucketByDate = new Map((Array.isArray(buckets) ? buckets : []).map((bucket) => [bucket.date, bucket]));
+      const movementByDate = {};
+      for (const session of Array.isArray(sessions) ? sessions : []) {
+        const date = sessionDate(session);
+        movementByDate[date] = (movementByDate[date] || 0) + sessionMovement(session);
+      }
+      const estimates = new Map();
+      for (const session of Array.isArray(sessions) ? sessions : []) {
+        const date = sessionDate(session);
+        const bucket = bucketByDate.get(date);
+        const movement = sessionMovement(session);
+        const totalMovement = movementByDate[date] || 0;
+        if (!bucket || !movement || !totalMovement) continue;
+        const share = movement / totalMovement;
+        const models = Array.isArray(bucket.models) && bucket.models.length
+          ? bucket.models
+          : [{ model: session.model || "Estimated", turns: bucket.turns || 0, threads: bucket.threads || 0 }];
+        const modelTurnTotal = models.reduce((sum, model) => sum + Number(model.turns || 0), 0) || 1;
+        estimates.set(sessionKey(session), {
+          tokens: Number(bucket.tokens || 0) * share,
+          threads: Number(bucket.threads || 0) * share,
+          turns: Number(bucket.turns || 0) * share,
+          models: models.map((model) => {
+            const modelShare = Number(model.turns || 0) / modelTurnTotal;
+            return {
+              model: model.model || model.name || "Estimated",
+              tokens: Number(bucket.tokens || 0) * share * modelShare,
+              threads: Number(model.threads ?? bucket.threads ?? 0) * share,
+              turns: Number(model.turns || 0) * share
+            };
+          }).filter((model) => model.turns > 0 || model.tokens > 0)
+        });
+      }
+      return estimates;
+    }
+
+    function sessionKey(session) {
+      return `${session.start || ""}|${session.end || ""}`;
+    }
+
+    function sessionTokens(session, estimates) {
+      const tokens = Number(session.tokensUsed || 0);
+      if (tokens > 0) return compactNumber(tokens);
+      const estimate = estimates?.get(sessionKey(session));
+      if (estimate?.tokens > 0) return `≈${compactNumber(estimate.tokens)}`;
+      return sessionUsageMoved(session) ? "≈0" : "0";
+    }
+
+    function sessionThreads(session, estimates) {
+      const threads = Number(session.threadDelta || 0);
+      if (threads > 0) return integer(threads);
+      const estimate = estimates?.get(sessionKey(session));
+      if (estimate?.threads > 0) return `≈${number(estimate.threads, 1)}`;
+      if (estimate?.turns > 0) return `≈${number(estimate.turns, 1)} turns`;
+      return sessionUsageMoved(session) ? "≈0" : "0";
+    }
+
+    function sessionModelSummary(session, estimates) {
+      const direct = session.model && session.model !== "Unknown" ? session.model : "";
+      const estimate = estimates?.get(sessionKey(session));
+      const models = Array.isArray(estimate?.models) ? estimate.models : [];
+      if (!models.length) return direct || "Not exposed";
+      const totalTurns = models.reduce((sum, model) => sum + Number(model.turns || 0), 0) || 1;
+      return models
+        .slice()
+        .sort((a, b) => Number(b.turns || 0) - Number(a.turns || 0))
+        .map((model) => `${model.model} ${Math.round((Number(model.turns || 0) / totalTurns) * 100)}%`)
+        .join(" / ");
+    }
+
+    function sessionCreditDelta(session) {
+      if (session.resetCreditsStart == null || session.resetCreditsEnd == null) return "--";
+      const start = Number(session.resetCreditsStart);
+      const end = Number(session.resetCreditsEnd);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return "--";
+      const delta = end - start;
+      const sign = delta > 0 ? "+" : "";
+      return `${start} → ${end} (${sign}${delta})`;
+    }
+
+    function parseLocalStamp(value) {
+      if (!value) return null;
+      const normalized = String(value).replace(" • ", "T");
+      const date = new Date(normalized);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+
     function accountLabel(account) {
       const profile = account.profileStats || {};
       return profile.displayName || account.name || account.email || account.accountId || "Unknown account";
@@ -1812,6 +2757,11 @@ function Write-CodexDashboardHtml {
       return Number.isFinite(n) ? n.toLocaleString() : "--";
     }
 
+    function number(value, digits = 2) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: digits }) : "--";
+    }
+
     function percent(value) {
       const n = Number(value);
       return Number.isFinite(n) ? `${trimNumber(n)}%` : "--";
@@ -1840,6 +2790,10 @@ function Write-CodexDashboardHtml {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
     }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replace(/`/g, "&#096;");
+    }
   </script>
 </body>
 </html>
@@ -1864,6 +2818,7 @@ foreach ($file in $cachedFiles) {
     if (-not [string]::IsNullOrWhiteSpace([string]$cached.accountId)) {
       $cached | Add-Member -MemberType NoteProperty -Name "isLive" -Value $false -Force
       $cached | Add-Member -MemberType NoteProperty -Name "dataSource" -Value "cached snapshot from $($file.Name)" -Force
+      Add-HistoryIfPresent $cached
       $accountsById[$cached.accountId] = $cached
     }
   } catch {
@@ -1937,7 +2892,14 @@ if (-not $SkipSaveCurrent) {
     }
 
     $liveRecord = [pscustomobject]$record
-    $accountsById[$info.accountId] = $liveRecord
+    Add-HistoryIfPresent $liveRecord
+    if ($SkipFetch -and $accountsById.ContainsKey($info.accountId)) {
+      $cachedLive = $accountsById[$info.accountId]
+      $cachedLive | Add-Member -MemberType NoteProperty -Name "isLive" -Value $true -Force
+      $cachedLive | Add-Member -MemberType NoteProperty -Name "dataSource" -Value "cached snapshot for active account; fetching skipped" -Force
+    } else {
+      $accountsById[$info.accountId] = $liveRecord
+    }
 
     $hasUsableLiveData = $null -ne $liveRecord.usageStatus -or $null -ne $liveRecord.profileStats -or $null -ne $liveRecord.credits
     if ($hasUsableLiveData -and -not $SkipFetch) {
