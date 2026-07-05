@@ -20,13 +20,10 @@ A self-contained local dashboard for checking Codex reset credits, current usage
 
 ## Files
 
-- `Update-CodexResets.ps1`: Queries the active Codex account, updates that account's cached snapshot, writes the local proxy URL, and regenerates `index.html`.
-- `Start-CodexResetsServer.ps1`: Starts the local browser/proxy server used for live refreshes.
+- `CodexResets.ps1`: Starts the local browser/proxy server, refreshes the active Codex account, updates caches/history, and regenerates `index.html` when needed.
 - `index.html`: The generated self-contained dashboard.
 - `.codex-cache/`: Local cached account snapshots from successful live polls. This directory is ignored by git.
 - `.codex-cache/history/`: Local per-account history files with successful polling samples, inferred sessions, and analytics usage rows. This directory is ignored by git.
-- `dashboard-screenshot.png`: Redacted screenshot for documentation.
-- `.gitignore`: Prevents saved auth bundles from being committed.
 
 ## How It Works
 
@@ -60,45 +57,40 @@ Daily Entries use the original per-model row layout. The analytics endpoint curr
 Run from this project directory:
 
 ```powershell
-.\Update-CodexResets.ps1
+.\CodexResets.ps1
 ```
 
-Then open:
+The script refreshes or creates the local cache and `index.html` if they are missing, starts the local proxy server, and opens the dashboard in your default browser:
 
 ```text
 http://127.0.0.1:8787/index.html
 ```
 
-Start the local proxy server first:
+Use update-only mode when you only want to refresh the cached data and regenerate `index.html` without starting the server:
 
 ```powershell
-.\Start-CodexResetsServer.ps1
+.\CodexResets.ps1 -Update
 ```
 
 The generated page refreshes the active account every 30 seconds while it is open. After switching Codex accounts, refresh the page or let the next 30-second poll run; the local server will detect the active account, update or create that account's tab, and save its latest snapshot/history.
 
-## Adding Accounts
-
-1. Sign into or switch to an account in Codex.
-2. Run `.\Update-CodexResets.ps1`.
-3. Repeat for each account you want included.
-
-Each account appears as a tab after the script successfully polls it at least once and writes a cached snapshot.
+To add new accounts simply sign into them in Codex with the server running and wait for the server to refresh the active account automatically. Each account appears as a tab after the script successfully polls it at least once and writes a cached snapshot.
 
 ## Script Options
 
 ```powershell
-.\Update-CodexResets.ps1 `
+.\CodexResets.ps1 `
   -AuthPath "$HOME\.codex\auth.json" `
   -CacheDir ".\.codex-cache" `
-  -OutputPath ".\index.html"
+  -Port 8787
 ```
 
 - `-AuthPath`: Path to the active Codex auth file.
 - `-CacheDir`: Directory where cached account snapshots are stored.
-- `-OutputPath`: Destination for the generated HTML page.
-- `-SkipSaveCurrent`: Render cached snapshots without polling the active auth file.
-- `-SkipFetch`: Regenerate the page without querying the backend; useful for layout testing.
+- `-Root`: Directory where `index.html` is written and served. Defaults to the script directory.
+- `-Port`: Local server port. Defaults to `8787`.
+- `-Update`: Refresh live data, regenerate `index.html`, and exit without starting the server.
+- `-SkipBrowser`: Start the server without opening the default browser.
 
 ## Privacy And Security
 
@@ -108,7 +100,7 @@ The `.codex-cache/` directory contains personal account telemetry. Keep it priva
 
 ## Troubleshooting
 
-If an account tab only shows cached data, switch Codex to that account and rerun `.\Update-CodexResets.ps1`.
+If an account tab only shows cached data, switch Codex to that account and rerun `.\CodexResets.ps1 -Update`.
 
 If the live browser refresh fails, the page keeps showing the cached snapshot from the last successful script poll.
 
